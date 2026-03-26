@@ -74,3 +74,253 @@ async fn live_events_query_endpoint_accepts_filters() {
     assert_eq!(json["filters"]["source"], "owls");
     assert_eq!(json["items"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn control_start_endpoint_marks_worker_running() {
+    let app = sabisabi::build_router_for_test();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["worker"]["status"], "running");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/control/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["worker"]["status"], "running");
+}
+
+#[tokio::test]
+async fn control_stop_endpoint_returns_worker_to_stopped() {
+    let app = sabisabi::build_router_for_test();
+
+    let _response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control/stop")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["worker"]["status"], "stopped");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/control/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["worker"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn live_events_query_endpoint_returns_persisted_items() {
+    let app = sabisabi::build_router_for_test_with_live_events(vec![sabisabi::TestLiveEvent {
+        event_id: String::from("owls:soccer:arsenal-v-chelsea"),
+        source: String::from("owls"),
+        sport: String::from("soccer"),
+        home_team: String::from("Arsenal"),
+        away_team: String::from("Chelsea"),
+        status: String::from("in"),
+    }]);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/live-events?sport=soccer&source=owls")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["items"][0]["event_id"],
+        "owls:soccer:arsenal-v-chelsea"
+    );
+    assert_eq!(json["items"][0]["home_team"], "Arsenal");
+    assert_eq!(json["items"][0]["away_team"], "Chelsea");
+    assert_eq!(json["items"][0]["status"], "in");
+}
+
+#[tokio::test]
+async fn ingest_live_events_endpoint_persists_items_for_query_api() {
+    let app = sabisabi::build_router_for_test();
+    let payload = serde_json::json!({
+        "items": [
+            {
+                "event_id": "owls:soccer:liverpool-v-spurs",
+                "source": "owls",
+                "sport": "soccer",
+                "home_team": "Liverpool",
+                "away_team": "Spurs",
+                "status": "in"
+            },
+            {
+                "event_id": "owls:tennis:alcaraz-v-sinner",
+                "source": "owls",
+                "sport": "tennis",
+                "home_team": "Carlos Alcaraz",
+                "away_team": "Jannik Sinner",
+                "status": "pre"
+            }
+        ]
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/live-events")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["accepted"], 2);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/live-events?sport=soccer&source=owls")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["items"][0]["event_id"],
+        "owls:soccer:liverpool-v-spurs"
+    );
+    assert_eq!(json["items"][0]["home_team"], "Liverpool");
+}
+
+#[tokio::test]
+async fn ingest_live_events_endpoint_rejects_duplicate_batch_without_partial_write() {
+    let app = sabisabi::build_router_for_test();
+    let payload = serde_json::json!({
+        "items": [
+            {
+                "event_id": "owls:soccer:duplicate",
+                "source": "owls",
+                "sport": "soccer",
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "status": "in"
+            },
+            {
+                "event_id": "owls:soccer:duplicate",
+                "source": "owls",
+                "sport": "soccer",
+                "home_team": "Liverpool",
+                "away_team": "Spurs",
+                "status": "pre"
+            }
+        ]
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/live-events")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/live-events?sport=soccer&source=owls")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["items"], serde_json::json!([]));
+}
