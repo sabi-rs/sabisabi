@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -637,6 +637,7 @@ fn build_history_points(
     points
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_quote(
     source: MarketIntelSourceId,
     event_name: &str,
@@ -706,8 +707,7 @@ fn oddsentry_auth_from_env() -> Option<OddsentryAuth> {
         .ok()?;
     let is_admin = env::var("ODDSENTRY_IS_ADMIN")
         .ok()
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
-        .unwrap_or(false);
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"));
     Some(OddsentryAuth {
         user_id,
         hmac,
