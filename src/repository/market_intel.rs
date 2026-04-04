@@ -15,6 +15,7 @@ use crate::market_intel::models::{
     DataSource, EndpointSnapshot, IngestMarketIntelResponse, MarketEventDetail, MarketHistoryPoint,
     MarketIntelDashboard, MarketIntelFilter, MarketIntelSourceId, MarketOpportunityRow,
     MarketQuoteComparisonRow, OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
+    SourcePolicy,
 };
 use crate::repository::audit::{
     AuditContext, AuditEntry, insert_audit_entries, prune_audit_entries,
@@ -38,6 +39,20 @@ struct SourceStatusRecord {
     health_status: String,
     detail: String,
     refreshed_at: String,
+    latency_ms: Option<i64>,
+    requests_remaining: Option<i64>,
+    requests_limit: Option<i64>,
+    rate_limit_reset_at: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, sqlx::FromRow)]
+struct SourcePolicyRecord {
+    source: String,
+    enabled: bool,
+    selection_priority: i32,
+    freshness_threshold_secs: i64,
+    reserve_requests_remaining: Option<i64>,
+    notes: String,
 }
 
 #[derive(Clone, serde::Serialize, sqlx::FromRow)]
@@ -49,6 +64,7 @@ struct SportLeagueRecord {
     active: bool,
     primary_source: String,
     primary_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+    primary_selection_reason: String,
     fallback_source: Option<String>,
     fallback_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -188,12 +204,16 @@ impl MarketIntelRepository {
                 cache,
                 audit_retention_days,
             } => {
-                let snapshot = build_sport_league_first(dashboard);
                 let batch_id = Uuid::new_v4();
                 let mut transaction = pool
                     .begin()
                     .await
                     .context("failed to start market intel transaction")?;
+                seed_source_policies(&mut transaction).await?;
+                let effective_policies = read_source_policies(&mut transaction).await?;
+                let mut dashboard = dashboard.clone();
+                dashboard.source_policies = effective_policies.clone();
+                let snapshot = build_sport_league_first(&dashboard, &effective_policies);
                 let previous_source_status = read_all_source_status(&mut transaction).await?;
                 let previous_leagues = read_all_sport_leagues(&mut transaction).await?;
                 let previous_events = read_all_market_events(&mut transaction).await?;
@@ -228,14 +248,18 @@ impl MarketIntelRepository {
 
                 if !dashboard.sources.is_empty() {
                     let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
-                        "INSERT INTO market_intel_source_status (source, load_mode, health_status, detail, refreshed_at) ",
+                        "INSERT INTO market_intel_source_status (source, load_mode, health_status, detail, refreshed_at, latency_ms, requests_remaining, requests_limit, rate_limit_reset_at) ",
                     );
                     builder.push_values(dashboard.sources.iter(), |mut b, status| {
                         b.push_bind(status.source.key())
                             .push_bind(status.mode.as_db())
                             .push_bind(status.status.as_db())
                             .push_bind(&status.detail)
-                            .push_bind(&status.refreshed_at);
+                            .push_bind(&status.refreshed_at)
+                            .push_bind(status.latency_ms)
+                            .push_bind(status.requests_remaining)
+                            .push_bind(status.requests_limit)
+                            .push_bind(&status.rate_limit_reset_at);
                     });
                     builder.push(
                         " ON CONFLICT (source) DO UPDATE SET \
@@ -243,6 +267,10 @@ impl MarketIntelRepository {
                           health_status = EXCLUDED.health_status, \
                           detail = EXCLUDED.detail, \
                           refreshed_at = EXCLUDED.refreshed_at, \
+                          latency_ms = EXCLUDED.latency_ms, \
+                          requests_remaining = EXCLUDED.requests_remaining, \
+                          requests_limit = EXCLUDED.requests_limit, \
+                          rate_limit_reset_at = EXCLUDED.rate_limit_reset_at, \
                           updated_at = NOW()",
                     );
                     builder
@@ -269,6 +297,10 @@ impl MarketIntelRepository {
                                 "health_status": status.status.as_db(),
                                 "detail": status.detail,
                                 "refreshed_at": status.refreshed_at,
+                                "latency_ms": status.latency_ms,
+                                "requests_remaining": status.requests_remaining,
+                                "requests_limit": status.requests_limit,
+                                "rate_limit_reset_at": status.rate_limit_reset_at,
                             })),
                             metadata: serde_json::json!({"phase": "source_status_upsert"}),
                         }
@@ -376,7 +408,7 @@ impl MarketIntelRepository {
                     let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
                         "INSERT INTO sport_leagues (\
                          id, sport_key, sport_title, group_name, active, primary_source, \
-                         primary_refreshed_at, fallback_source, fallback_refreshed_at\
+                         primary_refreshed_at, primary_selection_reason, fallback_source, fallback_refreshed_at\
                          ) ",
                     );
                     builder.push_values(snapshot.leagues.iter(), |mut b, league| {
@@ -387,7 +419,13 @@ impl MarketIntelRepository {
                             .push_bind(league.active)
                             .push_bind(league.primary_source.key())
                             .push_bind(league.primary_refreshed_at)
-                            .push_bind(league.fallback_source.map(DataSource::key))
+                            .push_bind(&league.primary_selection_reason)
+                            .push_bind(
+                                league
+                                    .fallback_source
+                                    .as_ref()
+                                    .map(|source| source.key().to_string()),
+                            )
                             .push_bind(league.fallback_refreshed_at);
                     });
                     builder
@@ -595,7 +633,7 @@ impl MarketIntelRepository {
                     .await
                     .context("failed to commit market intel transaction")?;
 
-                cache.set_json("market-intel:dashboard", dashboard).await;
+                cache.set_json("market-intel:dashboard", &dashboard).await;
 
                 Ok(IngestMarketIntelResponse {
                     leagues_updated: snapshot.leagues.len(),
@@ -638,26 +676,169 @@ impl MarketIntelRepository {
             }
         }
     }
+
+    pub async fn record_source_observation(
+        &self,
+        status: &SourceHealth,
+        endpoint_snapshots: &[EndpointSnapshot],
+        audit: &AuditContext,
+    ) -> SabisabiResult<()> {
+        match self {
+            Self::InMemory(current) => {
+                let mut dashboard = current.write().await;
+                if let Some(existing) = dashboard
+                    .sources
+                    .iter_mut()
+                    .find(|candidate| candidate.source == status.source)
+                {
+                    *existing = status.clone();
+                } else {
+                    dashboard.sources.push(status.clone());
+                }
+                dashboard.refreshed_at = status.refreshed_at.clone();
+                Ok(())
+            }
+            Self::Postgres {
+                pool,
+                cache,
+                audit_retention_days,
+            } => {
+                let mut transaction = pool
+                    .begin()
+                    .await
+                    .context("failed to start source observation transaction")?;
+
+                upsert_endpoint_catalog(&mut transaction).await?;
+                upsert_source_status(&mut transaction, status).await?;
+                insert_endpoint_snapshots(&mut transaction, endpoint_snapshots).await?;
+
+                let mut audit_entries = vec![AuditEntry {
+                    batch_id: Uuid::new_v4(),
+                    entity_type: "market_intel_source_status",
+                    entity_id: status.source.key().to_string(),
+                    action: "upsert",
+                    change_source: "repository.market_intel.record_source_observation",
+                    actor: audit.actor.clone(),
+                    request_id: audit.request_id.clone(),
+                    before_state: None,
+                    after_state: Some(serde_json::to_value(status).unwrap_or_default()),
+                    metadata: serde_json::json!({"snapshot_count": endpoint_snapshots.len()}),
+                }];
+
+                if !endpoint_snapshots.is_empty() {
+                    audit_entries.push(AuditEntry {
+                        batch_id: Uuid::new_v4(),
+                        entity_type: "market_source_endpoint_snapshot_batch",
+                        entity_id: format!("{}:{}", status.source.key(), endpoint_snapshots[0].endpoint_key),
+                        action: "append",
+                        change_source: "repository.market_intel.record_source_observation",
+                        actor: audit.actor.clone(),
+                        request_id: audit.request_id.clone(),
+                        before_state: None,
+                        after_state: Some(serde_json::json!({
+                            "provider": status.source.key(),
+                            "count": endpoint_snapshots.len(),
+                            "captured_at": endpoint_snapshots.last().map(|snapshot| snapshot.captured_at.clone()).unwrap_or_default(),
+                        })),
+                        metadata: serde_json::json!({
+                            "endpoint_keys": endpoint_snapshots.iter().map(|snapshot| snapshot.endpoint_key.clone()).collect::<Vec<_>>()
+                        }),
+                    });
+                }
+
+                insert_audit_entries(&mut transaction, &audit_entries).await?;
+                prune_audit_entries(&mut transaction, *audit_retention_days).await?;
+
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit source observation transaction")?;
+
+                let dashboard =
+                    read_dashboard_from_postgres(pool, &MarketIntelFilter::default()).await?;
+                cache.set_json("market-intel:dashboard", &dashboard).await;
+
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn upsert_source_status(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    status: &SourceHealth,
+) -> SabisabiResult<()> {
+    sqlx::query(
+        "INSERT INTO market_intel_source_status (source, load_mode, health_status, detail, refreshed_at, latency_ms, requests_remaining, requests_limit, rate_limit_reset_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (source) DO UPDATE SET \
+         load_mode = EXCLUDED.load_mode, \
+         health_status = EXCLUDED.health_status, \
+         detail = EXCLUDED.detail, \
+         refreshed_at = EXCLUDED.refreshed_at, \
+         latency_ms = EXCLUDED.latency_ms, \
+         requests_remaining = EXCLUDED.requests_remaining, \
+         requests_limit = EXCLUDED.requests_limit, \
+         rate_limit_reset_at = EXCLUDED.rate_limit_reset_at",
+    )
+    .bind(status.source.key())
+    .bind(status.mode.as_db())
+    .bind(status.status.as_db())
+    .bind(&status.detail)
+    .bind(&status.refreshed_at)
+    .bind(status.latency_ms)
+    .bind(status.requests_remaining)
+    .bind(status.requests_limit)
+    .bind(&status.rate_limit_reset_at)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to upsert market intel source status")?;
+
+    Ok(())
 }
 
 async fn read_dashboard_from_postgres(
     pool: &PgPool,
     filter: &MarketIntelFilter,
 ) -> SabisabiResult<MarketIntelDashboard> {
+    let normalized_source = if filter.source.trim().is_empty() {
+        String::new()
+    } else {
+        DataSource::from_db(&filter.source).key().to_string()
+    };
+    let mut policies = sqlx::query_as::<_, SourcePolicyRecord>(
+        "SELECT source, enabled, selection_priority, freshness_threshold_secs, reserve_requests_remaining, notes FROM market_source_policies ORDER BY selection_priority ASC, source ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read source policies")?
+    .into_iter()
+    .map(|row| SourcePolicy {
+        source: DataSource::from_db(&row.source),
+        enabled: row.enabled,
+        selection_priority: row.selection_priority,
+        freshness_threshold_secs: row.freshness_threshold_secs,
+        reserve_requests_remaining: row.reserve_requests_remaining,
+        notes: row.notes,
+    })
+    .collect::<Vec<_>>();
+    if policies.is_empty() {
+        policies = crate::market_intel::default_source_policies();
+    }
     let statuses = sqlx::query_as::<_, SourceStatusRecord>(
-        "SELECT source, load_mode, health_status, detail, refreshed_at \
+                    "SELECT source, load_mode, health_status, detail, refreshed_at, latency_ms, requests_remaining, requests_limit, rate_limit_reset_at \
                      FROM market_intel_source_status \
                      WHERE ($1 = '' OR source = $1) \
                      ORDER BY source ASC",
     )
-    .bind(&filter.source)
+    .bind(&normalized_source)
     .fetch_all(pool)
     .await
     .context("failed to read market intel source statuses")?;
 
     let leagues = sqlx::query_as::<_, SportLeagueRecord>(
         "SELECT id, sport_key, sport_title, group_name, active, primary_source, \
-                     primary_refreshed_at, fallback_source, fallback_refreshed_at \
+                     primary_refreshed_at, primary_selection_reason, fallback_source, fallback_refreshed_at \
                      FROM sport_leagues \
                      WHERE ($1 = '' OR sport_key = $1) \
                      ORDER BY sport_key ASC, group_name ASC",
@@ -720,6 +901,7 @@ async fn read_dashboard_from_postgres(
 
     Ok(rebuild_dashboard(
         filter,
+        policies,
         statuses,
         leagues,
         events,
@@ -728,11 +910,63 @@ async fn read_dashboard_from_postgres(
     ))
 }
 
+async fn seed_source_policies(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> SabisabiResult<()> {
+    let defaults = crate::market_intel::default_source_policies();
+    if defaults.is_empty() {
+        return Ok(());
+    }
+    let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+        "INSERT INTO market_source_policies (source, enabled, selection_priority, freshness_threshold_secs, reserve_requests_remaining, notes) ",
+    );
+    builder.push_values(defaults.iter(), |mut b, policy| {
+        b.push_bind(policy.source.key())
+            .push_bind(policy.enabled)
+            .push_bind(policy.selection_priority)
+            .push_bind(policy.freshness_threshold_secs)
+            .push_bind(policy.reserve_requests_remaining)
+            .push_bind(&policy.notes);
+    });
+    builder.push(" ON CONFLICT (source) DO NOTHING");
+    builder
+        .build()
+        .execute(&mut **transaction)
+        .await
+        .context("failed to seed source policies")?;
+    Ok(())
+}
+
+async fn read_source_policies(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> SabisabiResult<Vec<SourcePolicy>> {
+    let rows = sqlx::query_as::<_, SourcePolicyRecord>(
+        "SELECT source, enabled, selection_priority, freshness_threshold_secs, reserve_requests_remaining, notes FROM market_source_policies ORDER BY selection_priority ASC, source ASC",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to read source policies")?;
+    if rows.is_empty() {
+        return Ok(crate::market_intel::default_source_policies());
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| SourcePolicy {
+            source: DataSource::from_db(&row.source),
+            enabled: row.enabled,
+            selection_priority: row.selection_priority,
+            freshness_threshold_secs: row.freshness_threshold_secs,
+            reserve_requests_remaining: row.reserve_requests_remaining,
+            notes: row.notes,
+        })
+        .collect())
+}
+
 async fn read_all_source_status(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
 ) -> SabisabiResult<HashMap<String, SourceStatusRecord>> {
     let rows = sqlx::query_as::<_, SourceStatusRecord>(
-        "SELECT source, load_mode, health_status, detail, refreshed_at FROM market_intel_source_status",
+        "SELECT source, load_mode, health_status, detail, refreshed_at, latency_ms, requests_remaining, requests_limit, rate_limit_reset_at FROM market_intel_source_status",
     )
     .fetch_all(&mut **transaction)
     .await
@@ -747,7 +981,7 @@ async fn read_all_sport_leagues(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
 ) -> SabisabiResult<Vec<SportLeagueRecord>> {
     sqlx::query_as::<_, SportLeagueRecord>(
-        "SELECT id, sport_key, sport_title, group_name, active, primary_source, primary_refreshed_at, fallback_source, fallback_refreshed_at FROM sport_leagues",
+        "SELECT id, sport_key, sport_title, group_name, active, primary_source, primary_refreshed_at, primary_selection_reason, fallback_source, fallback_refreshed_at FROM sport_leagues",
     )
     .fetch_all(&mut **transaction)
     .await
@@ -911,13 +1145,20 @@ fn parse_snapshot_timestamp(value: &str) -> DateTime<Utc> {
             trimmed
                 .parse::<i64>()
                 .ok()
-                .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+                .and_then(|raw| {
+                    if raw >= 1_000_000_000_000 {
+                        Utc.timestamp_millis_opt(raw).single()
+                    } else {
+                        Utc.timestamp_opt(raw, 0).single()
+                    }
+                })
         })
         .unwrap_or_else(Utc::now)
 }
 
 fn rebuild_dashboard(
     filter: &MarketIntelFilter,
+    source_policies: Vec<SourcePolicy>,
     statuses: Vec<SourceStatusRecord>,
     leagues: Vec<SportLeagueRecord>,
     events: Vec<MarketEventRecord>,
@@ -932,6 +1173,10 @@ fn rebuild_dashboard(
             status: SourceHealthStatus::from_db(&row.health_status),
             detail: row.detail,
             refreshed_at: row.refreshed_at,
+            latency_ms: row.latency_ms,
+            requests_remaining: row.requests_remaining,
+            requests_limit: row.requests_limit,
+            rate_limit_reset_at: row.rate_limit_reset_at,
         })
         .collect::<Vec<_>>();
 
@@ -967,7 +1212,7 @@ fn rebuild_dashboard(
         };
         let source = DataSource::from_db(&quote.source);
         let row = MarketQuoteComparisonRow {
-            source,
+            source: source.clone(),
             event_id: event.event_id.clone(),
             market_id: quote.market_id,
             selection_id: quote.selection_id,
@@ -1001,8 +1246,11 @@ fn rebuild_dashboard(
             .unwrap_or_default(),
         status_line: String::new(),
         sources,
+        source_policies,
         ..MarketIntelDashboard::default()
     };
+
+    dashboard.total_events = events.len();
 
     for record in opportunities {
         let Some(league) = leagues_by_id.get(&record.sport_league_id) else {
@@ -1010,13 +1258,16 @@ fn rebuild_dashboard(
         };
         let source = DataSource::from_db(&record.source);
         let kind = OpportunityKind::from_db(&record.kind);
-        if !include_row(filter, league, source, kind) {
+        if !include_row(filter, league, &source, kind) {
             continue;
         }
-        let event =
-            events_by_identity.get(&(record.sport_league_id, record.event_id.clone(), source));
+        let event = events_by_identity.get(&(
+            record.sport_league_id,
+            record.event_id.clone(),
+            source.clone(),
+        ));
         let row = MarketOpportunityRow {
-            source,
+            source: source.clone(),
             kind,
             id: record.id.to_string(),
             sport: league.sport_key.clone(),
@@ -1063,6 +1314,67 @@ fn rebuild_dashboard(
     }
 
     dashboard.event_detail = build_event_detail(filter, &leagues_by_id, &events, &quotes_by_event);
+    dashboard.total_opportunities = dashboard.markets.len()
+        + dashboard.arbitrages.len()
+        + dashboard.plus_ev.len()
+        + dashboard.drops.len()
+        + dashboard.value.len();
+    dashboard.sports = leagues_by_id
+        .values()
+        .map(|league| {
+            let primary_source = DataSource::from_db(&league.primary_source);
+            let event_count = events
+                .iter()
+                .filter(|event| {
+                    event.sport_league_id == league.id
+                        && DataSource::from_db(&event.source) == primary_source
+                })
+                .count();
+            let quote_count = quotes_by_event
+                .iter()
+                .filter(|((sport_league_id, _, source), _)| {
+                    *sport_league_id == league.id && *source == primary_source
+                })
+                .map(|(_, quotes)| quotes.len())
+                .sum();
+            let arbitrage_count = dashboard
+                .arbitrages
+                .iter()
+                .filter(|row| {
+                    row.sport == league.sport_key && row.competition_name == league.group_name
+                })
+                .count();
+            let positive_ev_count = dashboard
+                .plus_ev
+                .iter()
+                .filter(|row| {
+                    row.sport == league.sport_key && row.competition_name == league.group_name
+                })
+                .count();
+            let value_count = dashboard
+                .value
+                .iter()
+                .filter(|row| {
+                    row.sport == league.sport_key && row.competition_name == league.group_name
+                })
+                .count();
+            crate::market_intel::models::SportDashboard {
+                sport_key: league.sport_key.clone(),
+                sport_title: league.sport_title.clone(),
+                group_name: league.group_name.clone(),
+                active: league.active,
+                primary_source,
+                primary_refreshed_at: league.primary_refreshed_at.map(|ts| ts.to_rfc3339()),
+                primary_selection_reason: league.primary_selection_reason.clone(),
+                fallback_available: league.fallback_source.is_some(),
+                event_count,
+                quote_count,
+                arbitrage_count,
+                positive_ev_count,
+                value_count,
+            }
+        })
+        .collect();
     dashboard.status_line = format!(
         "Persisted intel: {} markets, {} arbs, {} +EV, {} value, {} drops.",
         dashboard.markets.len(),
@@ -1084,6 +1396,12 @@ fn build_event_detail(
         return None;
     }
 
+    let normalized_source = if filter.source.trim().is_empty() {
+        String::new()
+    } else {
+        DataSource::from_db(&filter.source).key().to_string()
+    };
+
     let selected = events.iter().find(|event| {
         if event.event_id != filter.event_id {
             return false;
@@ -1092,8 +1410,8 @@ fn build_event_detail(
             return false;
         };
         let source = DataSource::from_db(&event.source);
-        if !filter.source.is_empty() {
-            return source.key() == filter.source;
+        if !normalized_source.is_empty() {
+            return source.key() == normalized_source;
         }
         if filter.use_fallback {
             return league.fallback_source.as_deref().map(DataSource::from_db) == Some(source);
@@ -1104,7 +1422,7 @@ fn build_event_detail(
     let league = leagues_by_id.get(&selected.sport_league_id)?;
     let source = DataSource::from_db(&selected.source);
     Some(MarketEventDetail {
-        source,
+        source: source.clone(),
         event_id: selected.event_id.clone(),
         sport: league.sport_key.clone(),
         event_name: selected.event_name.clone(),
@@ -1127,17 +1445,22 @@ fn build_event_detail(
 fn include_row(
     filter: &MarketIntelFilter,
     league: &SportLeagueRecord,
-    source: DataSource,
+    source: &DataSource,
     kind: OpportunityKind,
 ) -> bool {
     if !filter.source.is_empty() {
-        return source.key() == filter.source;
+        return source.key() == DataSource::from_db(&filter.source).key();
     }
     if matches!(kind, OpportunityKind::Market) {
         if filter.use_fallback {
-            return league.fallback_source.as_deref().map(DataSource::from_db) == Some(source);
+            return league
+                .fallback_source
+                .as_deref()
+                .map(DataSource::from_db)
+                .as_ref()
+                == Some(source);
         }
-        return DataSource::from_db(&league.primary_source) == source;
+        return DataSource::from_db(&league.primary_source) == *source;
     }
     true
 }
@@ -1161,8 +1484,13 @@ fn filter_dashboard(
     dashboard: &MarketIntelDashboard,
     filter: &MarketIntelFilter,
 ) -> MarketIntelDashboard {
+    let normalized_source = if filter.source.trim().is_empty() {
+        String::new()
+    } else {
+        DataSource::from_db(&filter.source).key().to_string()
+    };
     let matches = |row: &MarketOpportunityRow| {
-        (filter.source.is_empty() || row.source.key() == filter.source)
+        (normalized_source.is_empty() || row.source.key() == normalized_source)
             && (filter.sport_key.is_empty() || row.sport == filter.sport_key)
             && (filter.event_id.is_empty() || row.event_id == filter.event_id)
             && (filter.kind.is_empty() || row.kind.as_db() == filter.kind)
@@ -1173,9 +1501,26 @@ fn filter_dashboard(
         sources: dashboard
             .sources
             .iter()
-            .filter(|item| filter.source.is_empty() || item.source.key() == filter.source)
+            .filter(|item| normalized_source.is_empty() || item.source.key() == normalized_source)
             .cloned()
             .collect(),
+        source_policies: dashboard
+            .source_policies
+            .iter()
+            .filter(|item| normalized_source.is_empty() || item.source.key() == normalized_source)
+            .cloned()
+            .collect(),
+        sports: dashboard
+            .sports
+            .iter()
+            .filter(|item| {
+                (normalized_source.is_empty() || item.primary_source.key() == normalized_source)
+                    && (filter.sport_key.is_empty() || item.sport_key == filter.sport_key)
+            })
+            .cloned()
+            .collect(),
+        total_events: dashboard.total_events,
+        total_opportunities: dashboard.total_opportunities,
         markets: dashboard
             .markets
             .iter()
@@ -1207,7 +1552,7 @@ fn filter_dashboard(
             .cloned()
             .collect(),
         event_detail: dashboard.event_detail.clone().filter(|item| {
-            (filter.source.is_empty() || item.source.key() == filter.source)
+            (normalized_source.is_empty() || item.source.key() == normalized_source)
                 && (filter.sport_key.is_empty() || item.sport == filter.sport_key)
                 && (filter.event_id.is_empty() || item.event_id == filter.event_id)
         }),

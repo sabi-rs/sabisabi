@@ -6,7 +6,9 @@ mod owls;
 mod repository;
 
 use std::env;
+use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -21,7 +23,7 @@ use error::{SabisabiError, ValidationError};
 use market_intel::{IngestMarketIntelResponse, MarketIntelDashboard, MarketIntelFilter};
 use model::{
     AuditTrailFilter, AuditTrailResponse, IngestLiveEventsRequest, IngestLiveEventsResponse,
-    LiveEventsFilter, WorkerStatus,
+    LiveEventItem, LiveEventsFilter, WorkerStatus,
 };
 use repository::audit::{AuditContext, AuditRepository};
 use repository::control::ControlRepository;
@@ -48,6 +50,10 @@ pub struct Settings {
     control_token: Option<String>,
     database_url: String,
     audit_retention_days: Option<i64>,
+    owls_api_key: Option<String>,
+    owls_base_url: String,
+    owls_realtime_sports: Vec<String>,
+    owls_realtime_idle_reconnect_secs: u64,
     redis_url: Option<String>,
     hot_cache_ttl_secs: u64,
     port: u16,
@@ -60,6 +66,17 @@ impl Default for Settings {
             control_token: None,
             database_url: String::from("postgres://postgres:postgres@localhost:5432/sabisabi"),
             audit_retention_days: Some(90),
+            owls_api_key: None,
+            owls_base_url: String::from("https://api.owlsinsight.com"),
+            owls_realtime_sports: vec![
+                String::from("soccer"),
+                String::from("nba"),
+                String::from("nfl"),
+                String::from("ncaab"),
+                String::from("nhl"),
+                String::from("mlb"),
+            ],
+            owls_realtime_idle_reconnect_secs: 30,
             redis_url: None,
             hot_cache_ttl_secs: 120,
             port: 4080,
@@ -83,6 +100,31 @@ impl Settings {
                 .ok()
                 .and_then(|value| value.parse::<i64>().ok())
                 .or(defaults.audit_retention_days),
+            owls_api_key: env::var("SABISABI_OWLS_API_KEY")
+                .ok()
+                .or_else(|| env::var("OWLS_INSIGHT_API_KEY").ok())
+                .or_else(load_owls_api_key_from_dotenv_candidates)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            owls_base_url: env::var("SABISABI_OWLS_BASE_URL").unwrap_or(defaults.owls_base_url),
+            owls_realtime_sports: env::var("SABISABI_OWLS_REALTIME_SPORTS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|segment| !segment.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|sports| !sports.is_empty())
+                .unwrap_or(defaults.owls_realtime_sports),
+            owls_realtime_idle_reconnect_secs: env::var(
+                "SABISABI_OWLS_REALTIME_IDLE_RECONNECT_SECS",
+            )
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(defaults.owls_realtime_idle_reconnect_secs),
             redis_url: env::var("SABISABI_REDIS_URL")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -156,6 +198,65 @@ impl Settings {
     }
 }
 
+fn load_owls_api_key_from_dotenv_candidates() -> Option<String> {
+    for path in dotenv_candidates() {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if let Some(parsed) = parse_owls_api_key_from_line(line) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn parse_owls_api_key_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let candidate = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, value) = candidate.split_once('=')?;
+    if !matches!(key.trim(), "OWLS_INSIGHT_API_KEY" | "OWLSINSIGHT_API_KEY") {
+        return None;
+    }
+
+    let parsed = value
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+fn dotenv_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        paths.push(home_path.join(".env"));
+        paths.push(home_path.join(".env.local"));
+        paths.push(home_path.join(".zshenv"));
+        paths.push(home_path.join(".zshrc"));
+        paths.push(home_path.join(".bashrc"));
+        paths.push(home_path.join(".profile"));
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            paths.push(ancestor.join(".env"));
+            paths.push(ancestor.join(".env.local"));
+        }
+    }
+    paths
+}
+
 impl AppState {
     /// # Errors
     /// Returns an error if the database connection fails or migrations cannot be applied.
@@ -221,6 +322,49 @@ impl AppState {
             ),
         }
     }
+
+    pub(crate) fn owls_realtime_config(&self) -> Option<owls::RealtimeIngestConfig> {
+        self.settings.owls_realtime_config()
+    }
+
+    pub(crate) async fn record_owls_realtime_observation(
+        &self,
+        status: &market_intel::models::SourceHealth,
+        endpoint_snapshots: &[market_intel::models::EndpointSnapshot],
+        live_events: &[LiveEventItem],
+    ) -> Result<()> {
+        let audit = AuditContext {
+            actor: String::from("system.owls_realtime"),
+            request_id: String::from("owls-realtime"),
+        };
+        self.market_intel_repository
+            .record_source_observation(status, endpoint_snapshots, &audit)
+            .await?;
+        self.live_event_repository
+            .upsert_live_events(live_events, &audit)
+            .await?;
+        Ok(())
+    }
+}
+
+impl Settings {
+    pub(crate) fn owls_realtime_config(&self) -> Option<owls::RealtimeIngestConfig> {
+        let api_key = self.owls_api_key.clone()?;
+        if self.owls_realtime_sports.is_empty() {
+            return None;
+        }
+
+        Some(owls::RealtimeIngestConfig {
+            base_url: self.owls_base_url.clone(),
+            api_key,
+            sports: self.owls_realtime_sports.clone(),
+            idle_reconnect_secs: self.owls_realtime_idle_reconnect_secs,
+        })
+    }
+}
+
+pub fn spawn_background_tasks(state: Arc<AppState>) {
+    owls::spawn_realtime_ingest(state);
 }
 
 pub fn build_router_for_test() -> Router {

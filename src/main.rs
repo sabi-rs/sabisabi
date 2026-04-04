@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
     let settings = sabisabi::Settings::from_env();
     let bind_address = settings.socket_address();
     let state = Arc::new(sabisabi::AppState::from_settings(settings).await?);
+    sabisabi::spawn_background_tasks(state.clone());
     let app = sabisabi::build_router(state);
 
     let listener = TcpListener::bind(&bind_address).await?;

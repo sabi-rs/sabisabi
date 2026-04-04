@@ -1,38 +1,66 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DataSource {
-    #[default]
-    Oddsentry,
-    OddsApi,
-    FairOdds,
-}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DataSource(String);
 
 impl DataSource {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Oddsentry => "oddsentry",
-            Self::OddsApi => "oddsapi",
-            Self::FairOdds => "fairodds",
-        }
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(normalize_source_key(&value.into()))
+    }
+
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::owls(),
+            Self::oddsentry(),
+            Self::odds_api(),
+            Self::fair_odds(),
+        ]
+    }
+
+    pub fn owls() -> Self {
+        Self::new("owls")
+    }
+
+    pub fn oddsentry() -> Self {
+        Self::new("oddsentry")
+    }
+
+    pub fn odds_api() -> Self {
+        Self::new("odds_api")
+    }
+
+    pub fn fair_odds() -> Self {
+        Self::new("fair_odds")
+    }
+
+    pub fn key(&self) -> &str {
+        &self.0
     }
 
     pub fn from_db(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "oddsapi" | "odds_api" | "the-odds-api" => Self::OddsApi,
-            "fairodds" | "fair_odds" => Self::FairOdds,
-            _ => Self::Oddsentry,
-        }
+        Self::new(value)
     }
 
-    pub fn priority(&self) -> u8 {
-        match self {
-            Self::Oddsentry => 1,
-            Self::FairOdds => 2,
-            Self::OddsApi => 3,
+    pub fn default_priority(&self) -> i32 {
+        match self.key() {
+            "owls" => 0,
+            "oddsentry" => 1,
+            "fair_odds" => 2,
+            "odds_api" => 3,
+            _ => 100,
         }
+    }
+}
+
+fn normalize_source_key(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "oddsapi" | "odds_api" | "the-odds-api" => String::from("odds_api"),
+        "fairodds" | "fair_odds" => String::from("fair_odds"),
+        "oddsentry" => String::from("oddsentry"),
+        "owls" | "owlsinsight" | "owls_insight" => String::from("owls"),
+        other => other.to_string(),
     }
 }
 
@@ -78,6 +106,7 @@ pub struct SportLeague {
     pub active: bool,
     pub primary_source: DataSource,
     pub primary_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub primary_selection_reason: String,
     pub fallback_source: Option<DataSource>,
     pub fallback_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -165,7 +194,7 @@ pub struct MarketOpportunity {
     pub computed_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SportDashboard {
     pub sport_key: String,
     pub sport_title: String,
@@ -173,6 +202,7 @@ pub struct SportDashboard {
     pub active: bool,
     pub primary_source: DataSource,
     pub primary_refreshed_at: Option<String>,
+    pub primary_selection_reason: String,
     pub fallback_available: bool,
     pub event_count: usize,
     pub quote_count: usize,
@@ -181,7 +211,7 @@ pub struct SportDashboard {
     pub value_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraderDashboard {
     pub refreshed_at: String,
     pub sports: Vec<SportDashboard>,
@@ -231,6 +261,14 @@ pub struct MarketIntelDashboard {
     pub refreshed_at: String,
     pub status_line: String,
     pub sources: Vec<SourceHealth>,
+    #[serde(default)]
+    pub source_policies: Vec<SourcePolicy>,
+    #[serde(default)]
+    pub sports: Vec<SportDashboard>,
+    #[serde(default)]
+    pub total_events: usize,
+    #[serde(default)]
+    pub total_opportunities: usize,
     pub markets: Vec<MarketOpportunityRow>,
     pub arbitrages: Vec<MarketOpportunityRow>,
     pub plus_ev: Vec<MarketOpportunityRow>,
@@ -322,6 +360,37 @@ pub struct SourceHealth {
     pub status: SourceHealthStatus,
     pub detail: String,
     pub refreshed_at: String,
+    #[serde(default)]
+    pub latency_ms: Option<i64>,
+    #[serde(default)]
+    pub requests_remaining: Option<i64>,
+    #[serde(default)]
+    pub requests_limit: Option<i64>,
+    #[serde(default)]
+    pub rate_limit_reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePolicy {
+    pub source: DataSource,
+    pub enabled: bool,
+    pub selection_priority: i32,
+    pub freshness_threshold_secs: i64,
+    pub reserve_requests_remaining: Option<i64>,
+    pub notes: String,
+}
+
+impl Default for SourcePolicy {
+    fn default() -> Self {
+        Self {
+            source: DataSource::oddsentry(),
+            enabled: true,
+            selection_priority: 1,
+            freshness_threshold_secs: 120,
+            reserve_requests_remaining: None,
+            notes: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

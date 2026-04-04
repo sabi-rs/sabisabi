@@ -1,7 +1,8 @@
 use std::env;
 use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -18,6 +19,14 @@ pub struct OddsApiDashboardSlice {
     pub health: SourceHealth,
     pub markets: Vec<MarketOpportunityRow>,
     pub endpoint_snapshots: Vec<EndpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OddsApiFetchMeta {
+    latency_ms: Option<i64>,
+    requests_remaining: Option<i64>,
+    requests_limit: Option<i64>,
+    rate_limit_reset_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -68,11 +77,15 @@ pub fn load_dashboard_slice() -> Result<OddsApiDashboardSlice> {
             Err(error) => {
                 return Ok(OddsApiDashboardSlice {
                     health: SourceHealth {
-                        source: MarketIntelSourceId::OddsApi,
+                        source: MarketIntelSourceId::odds_api(),
                         mode: SourceLoadMode::Fixture,
                         status: SourceHealthStatus::Error,
                         detail: format!("Live OddsApi fetch failed: {error}"),
                         refreshed_at: String::new(),
+                        latency_ms: None,
+                        requests_remaining: None,
+                        requests_limit: None,
+                        rate_limit_reset_at: None,
                     },
                     markets: Vec::new(),
                     endpoint_snapshots: Vec::new(),
@@ -83,11 +96,15 @@ pub fn load_dashboard_slice() -> Result<OddsApiDashboardSlice> {
 
     Ok(OddsApiDashboardSlice {
         health: SourceHealth {
-            source: MarketIntelSourceId::OddsApi,
+            source: MarketIntelSourceId::odds_api(),
             mode: SourceLoadMode::Fixture,
             status: SourceHealthStatus::Degraded,
             detail: "No ODDSAPI_API_KEY configured - source unavailable".to_string(),
             refreshed_at: String::new(),
+            latency_ms: None,
+            requests_remaining: None,
+            requests_limit: None,
+            rate_limit_reset_at: None,
         },
         markets: Vec::new(),
         endpoint_snapshots: Vec::new(),
@@ -110,10 +127,13 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
     let base_url = env::var("ODDSAPI_BASE_URL").unwrap_or_else(|_| String::from(DEFAULT_BASE_URL));
 
     let sports_url = format!("{}/v4/sports/?apiKey={}", base_url, api_key);
-    let (sports, sports_payload): (Vec<OddsApiSport>, serde_json::Value) =
-        get_json_with_payload(client, &sports_url)?;
+    let (sports, sports_payload, sports_meta): (
+        Vec<OddsApiSport>,
+        serde_json::Value,
+        OddsApiFetchMeta,
+    ) = get_json_with_payload(client, &sports_url)?;
     let mut endpoint_snapshots = vec![EndpointSnapshot {
-        source: MarketIntelSourceId::OddsApi,
+        source: MarketIntelSourceId::odds_api(),
         endpoint_key: String::from("sports"),
         requested_url: sports_url,
         capture_mode: SourceLoadMode::Live,
@@ -129,6 +149,7 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
     let mut all_events: Vec<OddsApiEvent> = Vec::new();
     let mut sports_processed = 0;
     let max_sports = 3;
+    let mut latest_meta = sports_meta.clone();
 
     for sport in active_sports.iter().take(max_sports) {
         let events_url = format!(
@@ -137,11 +158,12 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
         );
 
         match get_json_with_payload::<Vec<OddsApiEvent>>(client, &events_url) {
-            Ok((events, payload)) => {
+            Ok((events, payload, meta)) => {
                 all_events.extend(events);
                 sports_processed += 1;
+                latest_meta = meta;
                 endpoint_snapshots.push(EndpointSnapshot {
-                    source: MarketIntelSourceId::OddsApi,
+                    source: MarketIntelSourceId::odds_api(),
                     endpoint_key: String::from("sport_odds"),
                     requested_url: events_url,
                     capture_mode: SourceLoadMode::Live,
@@ -164,7 +186,7 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
 
     Ok(OddsApiDashboardSlice {
         health: SourceHealth {
-            source: MarketIntelSourceId::OddsApi,
+            source: MarketIntelSourceId::odds_api(),
             mode: SourceLoadMode::Live,
             status: SourceHealthStatus::Ready,
             detail: format!(
@@ -174,6 +196,10 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
                 sports_processed
             ),
             refreshed_at: refreshed_at.clone(),
+            latency_ms: latest_meta.latency_ms,
+            requests_remaining: latest_meta.requests_remaining,
+            requests_limit: latest_meta.requests_limit,
+            rate_limit_reset_at: latest_meta.rate_limit_reset_at,
         },
         markets: market_rows,
         endpoint_snapshots,
@@ -183,19 +209,35 @@ fn fetch_live_slice(client: &Client, api_key: &str) -> Result<OddsApiDashboardSl
 fn get_json_with_payload<T: for<'de> Deserialize<'de>>(
     client: &Client,
     url: &str,
-) -> Result<(T, serde_json::Value)> {
+) -> Result<(T, serde_json::Value, OddsApiFetchMeta)> {
+    let started_at = Instant::now();
     let response = client
         .get(url)
         .send()
         .with_context(|| format!("failed to request {url}"))?;
 
-    let remaining = response
+    let requests_remaining = response
         .headers()
         .get("x-requests-remaining")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|s| s.parse::<i64>().ok());
+    let requests_used = response
+        .headers()
+        .get("x-requests-used")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    let requests_last = response
+        .headers()
+        .get("x-requests-last")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    let requests_limit = requests_remaining
+        .zip(requests_used)
+        .map(|(remaining, used)| remaining + used);
+    let rate_limit_reset_at = requests_last
+        .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
 
-    if let Some(rem) = remaining {
+    if let Some(rem) = requests_remaining {
         tracing::debug!("OddsApi requests remaining: {}", rem);
     }
 
@@ -212,7 +254,16 @@ fn get_json_with_payload<T: for<'de> Deserialize<'de>>(
         .with_context(|| format!("failed to decode raw payload for {url}"))?;
     let typed = serde_json::from_value(payload.clone())
         .with_context(|| format!("failed to decode typed payload for {url}"))?;
-    Ok((typed, payload))
+    Ok((
+        typed,
+        payload,
+        OddsApiFetchMeta {
+            latency_ms: Some(started_at.elapsed().as_millis() as i64),
+            requests_remaining,
+            requests_limit,
+            rate_limit_reset_at,
+        },
+    ))
 }
 
 fn build_market_rows(events: &[OddsApiEvent]) -> Vec<MarketOpportunityRow> {
@@ -270,7 +321,7 @@ fn build_market_rows(events: &[OddsApiEvent]) -> Vec<MarketOpportunityRow> {
                 let sport_clone = sport.clone();
                 let commence_clone = commence_time.clone();
                 rows.push(MarketOpportunityRow {
-                    source: MarketIntelSourceId::OddsApi,
+                    source: MarketIntelSourceId::odds_api(),
                     kind: OpportunityKind::Market,
                     id: row_id,
                     sport: sport_clone.clone(),
@@ -319,7 +370,7 @@ fn build_quotes(
 
     if let Some(price) = home_price {
         quotes.push(MarketQuoteComparisonRow {
-            source: MarketIntelSourceId::OddsApi,
+            source: MarketIntelSourceId::odds_api(),
             event_id: event_id.to_string(),
             market_id: format!("{}:h2h", bookmaker_key),
             selection_id: format!("{}:home", bookmaker_key),
@@ -343,7 +394,7 @@ fn build_quotes(
 
     if let Some(price) = away_price {
         quotes.push(MarketQuoteComparisonRow {
-            source: MarketIntelSourceId::OddsApi,
+            source: MarketIntelSourceId::odds_api(),
             event_id: event_id.to_string(),
             market_id: format!("{}:h2h", bookmaker_key),
             selection_id: format!("{}:away", bookmaker_key),

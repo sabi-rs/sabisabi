@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 pub use models::{
     DataSource, IngestMarketIntelResponse, MarketEvent, MarketIntelDashboard, MarketIntelFilter,
-    MarketIntelRefreshBundle, MarketOpportunity, MarketOpportunityRow, MarketQuote, SportDashboard,
-    SportLeague, SportLeagueFirst, TraderDashboard,
+    MarketIntelRefreshBundle, MarketOpportunity, MarketOpportunityRow, MarketQuote, SourcePolicy,
+    SportDashboard, SportLeague, SportLeagueFirst, TraderDashboard,
 };
 
 pub fn load_dashboard() -> Result<MarketIntelDashboard> {
@@ -30,26 +30,37 @@ pub fn load_refresh_bundle() -> Result<MarketIntelRefreshBundle> {
         oddsapi.health.refreshed_at.as_str(),
     ]);
 
+    let mut dashboard = MarketIntelDashboard {
+        refreshed_at: refreshed_at.clone(),
+        status_line: format!(
+            "Intel ready: {} markets (oe), {} arbs, {} +EV, {} value, {} drops, {} oddsapi.",
+            oddsentry.markets.len(),
+            oddsentry.arbitrages.len(),
+            oddsentry.plus_ev.len(),
+            fairodds.value.len(),
+            fairodds.drops.len(),
+            oddsapi.markets.len(),
+        ),
+        sources: vec![oddsentry.health, fairodds.health, oddsapi.health],
+        source_policies: default_source_policies(),
+        markets: oddsentry.markets,
+        arbitrages: oddsentry.arbitrages,
+        plus_ev: oddsentry.plus_ev,
+        drops: fairodds.drops,
+        value: fairodds.value,
+        event_detail: oddsentry.event_detail,
+        ..MarketIntelDashboard::default()
+    };
+    let trader_dashboard = build_trader_dashboard(&build_sport_league_first(
+        &dashboard,
+        &dashboard.source_policies,
+    ));
+    dashboard.sports = trader_dashboard.sports.clone();
+    dashboard.total_events = trader_dashboard.total_events;
+    dashboard.total_opportunities = trader_dashboard.total_opportunities;
+
     Ok(MarketIntelRefreshBundle {
-        dashboard: MarketIntelDashboard {
-            refreshed_at: refreshed_at.clone(),
-            status_line: format!(
-                "Intel ready: {} markets (oe), {} arbs, {} +EV, {} value, {} drops, {} oddsapi.",
-                oddsentry.markets.len(),
-                oddsentry.arbitrages.len(),
-                oddsentry.plus_ev.len(),
-                fairodds.value.len(),
-                fairodds.drops.len(),
-                oddsapi.markets.len(),
-            ),
-            sources: vec![oddsentry.health, fairodds.health, oddsapi.health],
-            markets: oddsentry.markets,
-            arbitrages: oddsentry.arbitrages,
-            plus_ev: oddsentry.plus_ev,
-            drops: fairodds.drops,
-            value: fairodds.value,
-            event_detail: oddsentry.event_detail,
-        },
+        dashboard,
         endpoint_snapshots: oddsentry
             .endpoint_snapshots
             .into_iter()
@@ -72,10 +83,16 @@ fn latest_timestamp(values: &[&str]) -> String {
 /// Returns both raw data and the organized dashboard.
 pub fn load_sport_league_first() -> Result<SportLeagueFirst> {
     let dashboard = load_dashboard()?;
-    Ok(build_sport_league_first(&dashboard))
+    Ok(build_sport_league_first(
+        &dashboard,
+        &dashboard.source_policies,
+    ))
 }
 
-pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> SportLeagueFirst {
+pub(crate) fn build_sport_league_first(
+    dashboard: &MarketIntelDashboard,
+    source_policies: &[SourcePolicy],
+) -> SportLeagueFirst {
     let now = Utc::now();
     let refreshed_at = if dashboard.refreshed_at.trim().is_empty() {
         now.to_rfc3339()
@@ -85,7 +102,18 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
     let source_refresh = dashboard
         .sources
         .iter()
-        .filter_map(|status| parse_timestamp(&status.refreshed_at).map(|ts| (status.source, ts)))
+        .filter_map(|status| {
+            parse_timestamp(&status.refreshed_at).map(|ts| (status.source.clone(), ts))
+        })
+        .collect::<HashMap<_, _>>();
+    let source_health = dashboard
+        .sources
+        .iter()
+        .map(|status| (status.source.clone(), status.clone()))
+        .collect::<HashMap<_, _>>();
+    let source_policy_map = source_policies
+        .iter()
+        .map(|policy| (policy.source.clone(), policy.clone()))
         .collect::<HashMap<_, _>>();
 
     let mut league_meta = HashMap::<(String, String), (Uuid, String, bool)>::new();
@@ -109,7 +137,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
             .unwrap_or(now);
         update_latest(
             &mut league_source_times,
-            &(sport_key.clone(), group_name.clone(), row.source),
+            &(sport_key.clone(), group_name.clone(), row.source.clone()),
             row_timestamp,
         );
 
@@ -121,7 +149,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
                 sport_key: sport_key.clone(),
                 group_name: group_name.clone(),
                 event_id: event_id.clone(),
-                source: row.source,
+                source: row.source.clone(),
                 event_name: normalized(&row.event_name, &event_id),
                 home_team: infer_home_team(row),
                 away_team: infer_away_team(row),
@@ -135,7 +163,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
             id: Uuid::new_v4(),
             sport_league_id: league_id,
             event_id: event_id.clone(),
-            source: row.source,
+            source: row.source.clone(),
             kind: row.kind,
             market_name: row.market_name.clone(),
             selection_name: row.selection_name.clone(),
@@ -163,7 +191,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
             let quote_timestamp = parse_timestamp(&quote.updated_at).unwrap_or(row_timestamp);
             update_latest(
                 &mut league_source_times,
-                &(sport_key.clone(), group_name.clone(), quote.source),
+                &(sport_key.clone(), group_name.clone(), quote.source.clone()),
                 quote_timestamp,
             );
             let market_event_id = ensure_event(
@@ -173,7 +201,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
                     sport_key: sport_key.clone(),
                     group_name: group_name.clone(),
                     event_id: quote_event_id,
-                    source: quote.source,
+                    source: quote.source.clone(),
                     event_name: normalized(&quote.event_name, &row.event_name),
                     home_team: infer_home_team(row),
                     away_team: infer_away_team(row),
@@ -185,7 +213,7 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
             quotes.push(MarketQuote {
                 id: Uuid::new_v4(),
                 market_event_id,
-                source: quote.source,
+                source: quote.source.clone(),
                 market_id: quote.market_id.clone(),
                 selection_id: quote.selection_id.clone(),
                 market_name: quote.market_name.clone(),
@@ -209,38 +237,37 @@ pub(crate) fn build_sport_league_first(dashboard: &MarketIntelDashboard) -> Spor
     let leagues = league_meta
         .into_iter()
         .map(|((sport_key, group_name), (id, sport_title, active))| {
-            let sources = [
-                DataSource::Oddsentry,
-                DataSource::OddsApi,
-                DataSource::FairOdds,
-            ]
-            .into_iter()
-            .filter_map(|source| {
-                league_source_times
-                    .get(&(sport_key.clone(), group_name.clone(), source))
-                    .copied()
-                    .map(|ts| (source, ts))
-            })
-            .collect::<Vec<_>>();
-            let mut sources = sources;
-            sources.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then(left.0.priority().cmp(&right.0.priority()))
-            });
-            let primary = sources.first().copied();
-            let fallback = sources.get(1).copied();
+            let sources = DataSource::all()
+                .into_iter()
+                .filter_map(|source| {
+                    league_source_times
+                        .get(&(sport_key.clone(), group_name.clone(), source.clone()))
+                        .copied()
+                        .map(|ts| (source, ts))
+                })
+                .collect::<Vec<_>>();
+            let ranked = rank_sources(&sources, &source_policy_map, &source_health, now);
+            let primary = ranked.first().cloned();
+            let fallback = ranked.get(1).cloned();
             SportLeague {
                 id,
                 sport_key,
                 sport_title,
                 group_name,
                 active,
-                primary_source: primary.map(|item| item.0).unwrap_or(DataSource::Oddsentry),
-                primary_refreshed_at: primary.map(|item| item.1),
-                fallback_source: fallback.map(|item| item.0),
-                fallback_refreshed_at: fallback.map(|item| item.1),
+                primary_source: primary
+                    .as_ref()
+                    .map(|item| item.0.clone())
+                    .unwrap_or(DataSource::oddsentry()),
+                primary_refreshed_at: primary.as_ref().map(|item| item.1),
+                primary_selection_reason: source_selection_reason(
+                    primary.clone(),
+                    &source_policy_map,
+                    &source_health,
+                    now,
+                ),
+                fallback_source: fallback.as_ref().map(|item| item.0.clone()),
+                fallback_refreshed_at: fallback.as_ref().map(|item| item.1),
             }
         })
         .collect::<Vec<_>>();
@@ -287,8 +314,9 @@ pub(crate) fn build_trader_dashboard(snapshot: &SportLeagueFirst) -> TraderDashb
                 sport_title: league.sport_title.clone(),
                 group_name: league.group_name.clone(),
                 active: league.active,
-                primary_source: league.primary_source,
+                primary_source: league.primary_source.clone(),
                 primary_refreshed_at: league.primary_refreshed_at.map(|ts| ts.to_rfc3339()),
+                primary_selection_reason: league.primary_selection_reason.clone(),
                 fallback_available: league.fallback_source.is_some(),
                 event_count,
                 quote_count,
@@ -305,6 +333,167 @@ pub(crate) fn build_trader_dashboard(snapshot: &SportLeagueFirst) -> TraderDashb
         total_opportunities: snapshot.opportunities.len(),
         sports,
     }
+}
+
+pub(crate) fn default_source_policies() -> Vec<SourcePolicy> {
+    vec![
+        SourcePolicy {
+            source: DataSource::owls(),
+            enabled: true,
+            selection_priority: 0,
+            freshness_threshold_secs: 30,
+            reserve_requests_remaining: None,
+            notes: String::from(
+                "Streaming sharp realtime source when websocket ingest is healthy.",
+            ),
+        },
+        SourcePolicy {
+            source: DataSource::oddsentry(),
+            enabled: true,
+            selection_priority: 1,
+            freshness_threshold_secs: 120,
+            reserve_requests_remaining: None,
+            notes: String::from("Primary low-latency source when healthy and fresh."),
+        },
+        SourcePolicy {
+            source: DataSource::fair_odds(),
+            enabled: true,
+            selection_priority: 2,
+            freshness_threshold_secs: 300,
+            reserve_requests_remaining: None,
+            notes: String::from("Secondary value/drop source and fallback when available."),
+        },
+        SourcePolicy {
+            source: DataSource::odds_api(),
+            enabled: true,
+            selection_priority: 3,
+            freshness_threshold_secs: 600,
+            reserve_requests_remaining: Some(25),
+            notes: String::from("Rate-limited fallback source; protect remaining quota."),
+        },
+    ]
+}
+
+fn rank_sources(
+    candidates: &[(DataSource, DateTime<Utc>)],
+    policy_map: &HashMap<DataSource, SourcePolicy>,
+    health_map: &HashMap<DataSource, models::SourceHealth>,
+    now: DateTime<Utc>,
+) -> Vec<(DataSource, DateTime<Utc>)> {
+    let mut ranked = candidates
+        .iter()
+        .cloned()
+        .filter(|(source, _)| {
+            policy_map
+                .get(source)
+                .map(|policy| policy.enabled)
+                .unwrap_or(true)
+        })
+        .filter(|(source, _)| {
+            !matches!(
+                health_map.get(source).map(|status| status.status),
+                Some(models::SourceHealthStatus::Error | models::SourceHealthStatus::Offline)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| {
+        let left_meta = source_rank_meta(left.0.clone(), left.1, policy_map, health_map, now);
+        let right_meta = source_rank_meta(right.0.clone(), right.1, policy_map, health_map, now);
+        left_meta.cmp(&right_meta)
+    });
+    ranked
+}
+
+fn source_rank_meta(
+    source: DataSource,
+    refreshed_at: DateTime<Utc>,
+    policy_map: &HashMap<DataSource, SourcePolicy>,
+    health_map: &HashMap<DataSource, models::SourceHealth>,
+    now: DateTime<Utc>,
+) -> (u8, u8, u8, i64, i64, i32, u8) {
+    let policy = policy_map.get(&source).cloned().unwrap_or(SourcePolicy {
+        source: source.clone(),
+        selection_priority: source.default_priority(),
+        ..SourcePolicy::default()
+    });
+    let health = health_map.get(&source);
+    let freshness_rank = if (now - refreshed_at).num_seconds() <= policy.freshness_threshold_secs {
+        0
+    } else {
+        1
+    };
+    let rate_limit_rank: u8 = if let (Some(remaining), Some(reserve)) = (
+        health.and_then(|value| value.requests_remaining),
+        policy.reserve_requests_remaining,
+    ) {
+        if remaining <= reserve {
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let latency_rank = health
+        .and_then(|value| value.latency_ms)
+        .unwrap_or(i64::MAX);
+    let health_rank = match health
+        .map(|value| value.status)
+        .unwrap_or(models::SourceHealthStatus::Ready)
+    {
+        models::SourceHealthStatus::Ready => 0,
+        models::SourceHealthStatus::Degraded => 1,
+        models::SourceHealthStatus::Error => 2,
+        models::SourceHealthStatus::Offline => 3,
+    };
+    let recency_rank = -refreshed_at.timestamp_millis();
+    (
+        health_rank,
+        freshness_rank,
+        rate_limit_rank,
+        recency_rank,
+        latency_rank,
+        policy.selection_priority,
+        source.default_priority() as u8,
+    )
+}
+
+fn source_selection_reason(
+    selected: Option<(DataSource, DateTime<Utc>)>,
+    policy_map: &HashMap<DataSource, SourcePolicy>,
+    health_map: &HashMap<DataSource, models::SourceHealth>,
+    now: DateTime<Utc>,
+) -> String {
+    let Some((source, refreshed_at)) = selected else {
+        return String::from("no_available_source");
+    };
+    let policy = policy_map.get(&source).cloned().unwrap_or(SourcePolicy {
+        source: source.clone(),
+        selection_priority: source.default_priority(),
+        ..SourcePolicy::default()
+    });
+    let freshness = if (now - refreshed_at).num_seconds() <= policy.freshness_threshold_secs {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let rate_limit = match (
+        health_map
+            .get(&source)
+            .and_then(|value| value.requests_remaining),
+        policy.reserve_requests_remaining,
+    ) {
+        (Some(remaining), Some(reserve)) if remaining <= reserve => "rate_limited",
+        _ => "quota_ok",
+    };
+    format!(
+        "selected={} freshness={} priority={} rate_limit={}",
+        source.key(),
+        freshness,
+        policy.selection_priority,
+        rate_limit
+    )
 }
 
 fn collect_rows(dashboard: &MarketIntelDashboard) -> Vec<&MarketOpportunityRow> {
@@ -355,7 +544,7 @@ fn ensure_event(
         seed.sport_key,
         seed.group_name,
         seed.event_id.clone(),
-        seed.source,
+        seed.source.clone(),
     );
     let event_name = seed.event_name.clone();
     let home_team = seed.home_team.clone();
@@ -369,7 +558,7 @@ fn ensure_event(
         away_team,
         commence_time: seed.commence_time,
         is_live: seed.is_live,
-        source: seed.source,
+        source: seed.source.clone(),
         refreshed_at: seed.refreshed_at,
     });
     if event.event_name.trim().is_empty() {
@@ -496,12 +685,15 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(trimmed)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
-        .or_else(|| {
-            trimmed
-                .parse::<i64>()
-                .ok()
-                .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
-        })
+        .or_else(|| trimmed.parse::<i64>().ok().and_then(timestamp_from_epoch))
+}
+
+fn timestamp_from_epoch(raw: i64) -> Option<DateTime<Utc>> {
+    if raw >= 1_000_000_000_000 {
+        Utc.timestamp_millis_opt(raw).single()
+    } else {
+        Utc.timestamp_opt(raw, 0).single()
+    }
 }
 
 fn slugify(value: &str) -> String {
@@ -529,7 +721,13 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::load_dashboard;
+    use chrono::{Duration, Utc};
+
+    use super::{build_sport_league_first, default_source_policies, load_dashboard};
+    use crate::market_intel::models::{
+        DataSource, MarketIntelDashboard, MarketOpportunityRow, OpportunityKind, SourceHealth,
+        SourceHealthStatus, SourceLoadMode,
+    };
 
     #[test]
     fn dashboard_contains_all_sources() {
@@ -540,5 +738,106 @@ mod tests {
         assert!(!dashboard.plus_ev.is_empty());
         assert!(!dashboard.value.is_empty());
         assert!(!dashboard.drops.is_empty());
+    }
+
+    #[test]
+    fn source_policies_can_protect_rate_limited_source() {
+        let now = Utc::now();
+        let dashboard = MarketIntelDashboard {
+            refreshed_at: now.to_rfc3339(),
+            sources: vec![
+                SourceHealth {
+                    source: DataSource::odds_api(),
+                    mode: SourceLoadMode::Live,
+                    status: SourceHealthStatus::Ready,
+                    detail: String::new(),
+                    refreshed_at: now.to_rfc3339(),
+                    latency_ms: Some(50),
+                    requests_remaining: Some(2),
+                    requests_limit: Some(500),
+                    rate_limit_reset_at: None,
+                },
+                SourceHealth {
+                    source: DataSource::oddsentry(),
+                    mode: SourceLoadMode::Live,
+                    status: SourceHealthStatus::Ready,
+                    detail: String::new(),
+                    refreshed_at: (now - Duration::seconds(30)).to_rfc3339(),
+                    latency_ms: Some(20),
+                    requests_remaining: None,
+                    requests_limit: None,
+                    rate_limit_reset_at: None,
+                },
+            ],
+            markets: vec![
+                MarketOpportunityRow {
+                    source: DataSource::odds_api(),
+                    kind: OpportunityKind::Market,
+                    id: String::from("oddsapi:1"),
+                    sport: String::from("soccer_epl"),
+                    competition_name: String::from("Premier League"),
+                    event_id: String::from("e1"),
+                    event_name: String::from("Arsenal vs Chelsea"),
+                    market_name: String::from("Moneyline"),
+                    selection_name: String::from("Arsenal"),
+                    secondary_selection_name: String::new(),
+                    venue: String::from("oddsapi"),
+                    secondary_venue: String::new(),
+                    price: Some(2.1),
+                    secondary_price: None,
+                    fair_price: None,
+                    liquidity: None,
+                    edge_percent: None,
+                    arbitrage_margin: None,
+                    stake_hint: None,
+                    start_time: now.to_rfc3339(),
+                    updated_at: now.to_rfc3339(),
+                    event_url: String::new(),
+                    deep_link_url: String::new(),
+                    is_live: false,
+                    quotes: vec![],
+                    notes: vec![],
+                    raw_data: serde_json::json!({}),
+                },
+                MarketOpportunityRow {
+                    source: DataSource::oddsentry(),
+                    kind: OpportunityKind::Market,
+                    id: String::from("oddsentry:1"),
+                    sport: String::from("soccer_epl"),
+                    competition_name: String::from("Premier League"),
+                    event_id: String::from("e1"),
+                    event_name: String::from("Arsenal vs Chelsea"),
+                    market_name: String::from("Moneyline"),
+                    selection_name: String::from("Arsenal"),
+                    secondary_selection_name: String::new(),
+                    venue: String::from("oddsentry"),
+                    secondary_venue: String::new(),
+                    price: Some(2.05),
+                    secondary_price: None,
+                    fair_price: None,
+                    liquidity: None,
+                    edge_percent: None,
+                    arbitrage_margin: None,
+                    stake_hint: None,
+                    start_time: now.to_rfc3339(),
+                    updated_at: (now - Duration::seconds(30)).to_rfc3339(),
+                    event_url: String::new(),
+                    deep_link_url: String::new(),
+                    is_live: false,
+                    quotes: vec![],
+                    notes: vec![],
+                    raw_data: serde_json::json!({}),
+                },
+            ],
+            source_policies: default_source_policies(),
+            ..MarketIntelDashboard::default()
+        };
+
+        let snapshot = build_sport_league_first(&dashboard, &dashboard.source_policies);
+        assert_eq!(snapshot.leagues.len(), 1);
+        assert_eq!(snapshot.leagues[0].primary_source, DataSource::oddsentry());
+        assert!(snapshot.leagues[0]
+            .primary_selection_reason
+            .contains("selected=oddsentry"));
     }
 }

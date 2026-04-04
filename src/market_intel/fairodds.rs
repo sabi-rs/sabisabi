@@ -103,7 +103,7 @@ pub fn load_dashboard_slice() -> Result<FairOddsDashboardSlice> {
 
     Ok(FairOddsDashboardSlice {
         health: SourceHealth {
-            source: DataSource::FairOdds,
+            source: DataSource::fair_odds(),
             mode: SourceLoadMode::Fixture,
             status: SourceHealthStatus::Ready,
             detail: format!(
@@ -112,12 +112,16 @@ pub fn load_dashboard_slice() -> Result<FairOddsDashboardSlice> {
                 drops.len()
             ),
             refreshed_at: captured_at.clone(),
+            latency_ms: None,
+            requests_remaining: None,
+            requests_limit: None,
+            rate_limit_reset_at: None,
         },
         drops,
         value,
         endpoint_snapshots: vec![
             EndpointSnapshot {
-                source: DataSource::FairOdds,
+                source: DataSource::fair_odds(),
                 endpoint_key: String::from("value_calculated"),
                 requested_url: String::from("/api/value-calculated"),
                 capture_mode: SourceLoadMode::Fixture,
@@ -125,7 +129,7 @@ pub fn load_dashboard_slice() -> Result<FairOddsDashboardSlice> {
                 captured_at: captured_at.clone(),
             },
             EndpointSnapshot {
-                source: DataSource::FairOdds,
+                source: DataSource::fair_odds(),
                 endpoint_key: String::from("droppers"),
                 requested_url: String::from("/droppers?windowSec=300&sort=time&timing=prematch"),
                 capture_mode: SourceLoadMode::Fixture,
@@ -145,7 +149,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
         .unwrap_or_default();
     let mut quotes = Vec::new();
     quotes.push(MarketQuoteComparisonRow {
-        source: DataSource::FairOdds,
+        source: DataSource::fair_odds(),
         event_id: row.event_id.clone().unwrap_or_default(),
         market_id: String::new(),
         selection_id: String::new(),
@@ -167,7 +171,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
     });
     if let Some(fair_price) = row.effective_best_odds {
         quotes.push(MarketQuoteComparisonRow {
-            source: DataSource::FairOdds,
+            source: DataSource::fair_odds(),
             event_id: row.event_id.clone().unwrap_or_default(),
             market_id: String::new(),
             selection_id: String::new(),
@@ -193,7 +197,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
     }
 
     MarketOpportunityRow {
-        source: DataSource::FairOdds,
+        source: DataSource::fair_odds(),
         kind: OpportunityKind::Value,
         id: format!("fairodds:value:{index}"),
         sport: row.sport_title.clone().unwrap_or_default(),
@@ -230,7 +234,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
 fn build_drop_row(index: usize, row: &BookDropRow) -> MarketOpportunityRow {
     let updated_at = row.at.map(|value| value.to_string()).unwrap_or_default();
     let quotes = vec![MarketQuoteComparisonRow {
-        source: DataSource::FairOdds,
+        source: DataSource::fair_odds(),
         event_id: row.event_id.clone().unwrap_or_default(),
         market_id: String::new(),
         selection_id: String::new(),
@@ -252,7 +256,7 @@ fn build_drop_row(index: usize, row: &BookDropRow) -> MarketOpportunityRow {
     }];
 
     MarketOpportunityRow {
-        source: DataSource::FairOdds,
+        source: DataSource::fair_odds(),
         kind: OpportunityKind::Drop,
         id: format!("fairodds:drop:{index}"),
         sport: row.sport_title.clone().unwrap_or_default(),

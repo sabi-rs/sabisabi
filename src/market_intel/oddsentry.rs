@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
+use chrono::TimeZone;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
@@ -36,6 +38,11 @@ pub struct OddsentryDashboardSlice {
     pub plus_ev: Vec<MarketOpportunityRow>,
     pub event_detail: Option<MarketEventDetail>,
     pub endpoint_snapshots: Vec<EndpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OddsentryFetchMeta {
+    latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,7 +261,7 @@ fn fixture_slice() -> Result<OddsentryDashboardSlice> {
 
     Ok(OddsentryDashboardSlice {
         health: SourceHealth {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             mode: SourceLoadMode::Fixture,
             status: SourceHealthStatus::Ready,
             detail: format!(
@@ -264,6 +271,10 @@ fn fixture_slice() -> Result<OddsentryDashboardSlice> {
                 plus_ev_rows.len()
             ),
             refreshed_at: refreshed_at.clone(),
+            latency_ms: None,
+            requests_remaining: None,
+            requests_limit: None,
+            rate_limit_reset_at: None,
         },
         markets: market_rows,
         arbitrages: arbitrage_rows,
@@ -277,14 +288,23 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
     let base_url =
         env::var("ODDSENTRY_BASE_URL").unwrap_or_else(|_| String::from(DEFAULT_BASE_URL));
     let markets_url = format!("{base_url}/v1/odds");
-    let (markets, markets_payload): (OddsentryMarketsResponse, serde_json::Value) =
-        get_json_with_payload(client, auth, &markets_url)?;
+    let (markets, markets_payload, markets_meta): (
+        OddsentryMarketsResponse,
+        serde_json::Value,
+        OddsentryFetchMeta,
+    ) = get_json_with_payload(client, auth, &markets_url)?;
     let arbitrages_url = format!("{base_url}/v1/arbitrages");
-    let (arbitrages, arbitrages_payload): (OddsentryBetsResponse, serde_json::Value) =
-        get_json_with_payload(client, auth, &arbitrages_url)?;
+    let (arbitrages, arbitrages_payload, arbitrages_meta): (
+        OddsentryBetsResponse,
+        serde_json::Value,
+        OddsentryFetchMeta,
+    ) = get_json_with_payload(client, auth, &arbitrages_url)?;
     let plus_ev_url = format!("{base_url}/v1/positive_ev");
-    let (plus_ev, plus_ev_payload): (OddsentryBetsResponse, serde_json::Value) =
-        get_json_with_payload(client, auth, &plus_ev_url)?;
+    let (plus_ev, plus_ev_payload, plus_ev_meta): (
+        OddsentryBetsResponse,
+        serde_json::Value,
+        OddsentryFetchMeta,
+    ) = get_json_with_payload(client, auth, &plus_ev_url)?;
 
     let market_rows = build_market_rows(&markets.matches);
     let arbitrage_rows = build_arbitrage_rows(&arbitrages.bets);
@@ -302,8 +322,11 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
         .find(|event| !event.match_id.trim().is_empty())
         .map(|event| -> Result<MarketEventDetail> {
             let detail_url = format!("{base_url}/v1/odds/{}", event.match_id);
-            let (detail, detail_payload): (OddsentryEventDetailResponse, serde_json::Value) =
-                get_json_with_payload(client, auth, &detail_url)?;
+            let (detail, detail_payload, _detail_meta): (
+                OddsentryEventDetailResponse,
+                serde_json::Value,
+                OddsentryFetchMeta,
+            ) = get_json_with_payload(client, auth, &detail_url)?;
             let history_url = format!(
                 "{base_url}/v1/odds/{}/historical?resolution=hourly",
                 event.match_id
@@ -312,7 +335,7 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
                 get_json_with_payload::<OddsentryHistoricalResponse>(client, auth, &history_url)
                     .ok();
             endpoint_snapshots.push(live_snapshot("event_detail", detail_url, detail_payload));
-            if let Some((_, history_payload)) = history.as_ref() {
+            if let Some((_, history_payload, _history_meta)) = history.as_ref() {
                 endpoint_snapshots.push(live_snapshot(
                     "historical_hourly",
                     history_url,
@@ -321,7 +344,7 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
             }
             Ok(build_event_detail(
                 &detail,
-                history.as_ref().map(|(response, _)| response),
+                history.as_ref().map(|(response, _, _)| response),
             ))
         })
         .transpose()?;
@@ -342,7 +365,7 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
 
     Ok(OddsentryDashboardSlice {
         health: SourceHealth {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             mode: SourceLoadMode::Live,
             status: SourceHealthStatus::Ready,
             detail: format!(
@@ -352,6 +375,17 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
                 plus_ev_rows.len()
             ),
             refreshed_at: refreshed_at.clone(),
+            latency_ms: [
+                markets_meta.latency_ms,
+                arbitrages_meta.latency_ms,
+                plus_ev_meta.latency_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .max(),
+            requests_remaining: None,
+            requests_limit: None,
+            rate_limit_reset_at: None,
         },
         markets: market_rows,
         arbitrages: arbitrage_rows,
@@ -365,7 +399,8 @@ fn get_json_with_payload<T: for<'de> Deserialize<'de>>(
     client: &Client,
     auth: &OddsentryAuth,
     url: &str,
-) -> Result<(T, serde_json::Value)> {
+) -> Result<(T, serde_json::Value, OddsentryFetchMeta)> {
+    let started_at = Instant::now();
     let response = client
         .get(url)
         .header("X-Oddsentry-User", &auth.user_id)
@@ -385,7 +420,13 @@ fn get_json_with_payload<T: for<'de> Deserialize<'de>>(
         .with_context(|| format!("failed to decode raw payload for {url}"))?;
     let typed = serde_json::from_value(payload.clone())
         .with_context(|| format!("failed to decode typed payload for {url}"))?;
-    Ok((typed, payload))
+    Ok((
+        typed,
+        payload,
+        OddsentryFetchMeta {
+            latency_ms: Some(started_at.elapsed().as_millis() as i64),
+        },
+    ))
 }
 
 fn fixture_snapshot<T: serde::Serialize>(
@@ -395,7 +436,7 @@ fn fixture_snapshot<T: serde::Serialize>(
     captured_at: &str,
 ) -> EndpointSnapshot {
     EndpointSnapshot {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         endpoint_key: endpoint_key.to_string(),
         requested_url: requested_url.to_string(),
         capture_mode: SourceLoadMode::Fixture,
@@ -410,7 +451,7 @@ fn live_snapshot(
     payload: serde_json::Value,
 ) -> EndpointSnapshot {
     EndpointSnapshot {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         endpoint_key: endpoint_key.to_string(),
         requested_url,
         capture_mode: SourceLoadMode::Live,
@@ -423,7 +464,7 @@ fn build_market_rows(matches: &[OddsentryMatch]) -> Vec<MarketOpportunityRow> {
     matches
         .iter()
         .map(|item| MarketOpportunityRow {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             kind: OpportunityKind::Market,
             id: format!("oddsentry:market:{}", item.match_id),
             sport: item.game_id.clone(),
@@ -479,7 +520,7 @@ fn build_arbitrage_rows(bets: &[OddsentryBet]) -> Vec<MarketOpportunityRow> {
                 .unwrap_or_else(|| bet.team_two_name.clone());
             let quotes = vec![
                 build_quote(
-                    MarketIntelSourceId::Oddsentry,
+                    MarketIntelSourceId::oddsentry(),
                     &event_name,
                     &market_name,
                     &first_selection,
@@ -494,7 +535,7 @@ fn build_arbitrage_rows(bets: &[OddsentryBet]) -> Vec<MarketOpportunityRow> {
                     String::new(),
                 ),
                 build_quote(
-                    MarketIntelSourceId::Oddsentry,
+                    MarketIntelSourceId::oddsentry(),
                     &event_name,
                     &market_name,
                     &second_selection,
@@ -510,7 +551,7 @@ fn build_arbitrage_rows(bets: &[OddsentryBet]) -> Vec<MarketOpportunityRow> {
                 ),
             ];
             MarketOpportunityRow {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 kind: OpportunityKind::Arbitrage,
                 id: format!("oddsentry:arb:{index}"),
                 sport: bet.game_id.clone().unwrap_or_default(),
@@ -572,7 +613,7 @@ fn build_positive_ev_rows(bets: &[OddsentryBet]) -> Vec<MarketOpportunityRow> {
                 (divisor > 0.0).then_some(odds / divisor)
             });
             let quotes = vec![build_quote(
-                MarketIntelSourceId::Oddsentry,
+                MarketIntelSourceId::oddsentry(),
                 &event_name,
                 &market_name,
                 &selection_name,
@@ -587,7 +628,7 @@ fn build_positive_ev_rows(bets: &[OddsentryBet]) -> Vec<MarketOpportunityRow> {
                 String::new(),
             )];
             MarketOpportunityRow {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 kind: OpportunityKind::PositiveEv,
                 id: format!("oddsentry:ev:{index}"),
                 sport: bet.game_id.clone().unwrap_or_default(),
@@ -643,7 +684,7 @@ fn build_event_detail(
             .clone()
             .unwrap_or_else(|| response.team_two_name.clone());
         quotes.push(build_quote(
-            MarketIntelSourceId::Oddsentry,
+            MarketIntelSourceId::oddsentry(),
             &event_name,
             &market_name,
             &first_selection,
@@ -658,7 +699,7 @@ fn build_event_detail(
             format!("{}:team_one", quote.key),
         ));
         quotes.push(build_quote(
-            MarketIntelSourceId::Oddsentry,
+            MarketIntelSourceId::oddsentry(),
             &event_name,
             &market_name,
             &second_selection,
@@ -674,7 +715,7 @@ fn build_event_detail(
         ));
     }
     MarketEventDetail {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         event_id: response.match_id.clone(),
         sport: response.game_id.clone(),
         event_name,
@@ -784,7 +825,19 @@ fn latest_updated_at(values: &[&str]) -> String {
         .copied()
         .find(|value| !value.trim().is_empty())
         .unwrap_or_default()
-        .to_string()
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|raw| chrono::Utc.timestamp_millis_opt(raw).single())
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(|| {
+            values
+                .iter()
+                .copied()
+                .find(|value| !value.trim().is_empty())
+                .unwrap_or_default()
+                .to_string()
+        })
 }
 
 fn oddsentry_auth_from_env() -> Option<OddsentryAuth> {

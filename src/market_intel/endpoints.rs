@@ -243,7 +243,7 @@ fn owls_entries() -> Vec<SourceEndpointCatalogEntry> {
             "owls",
             "realtime",
             "GET",
-            "/api/v1/realtime",
+            "/api/v1/{sport}/realtime",
             "rest",
             "realtime",
             "stream_or_poll",
@@ -254,7 +254,7 @@ fn owls_entries() -> Vec<SourceEndpointCatalogEntry> {
             "owls",
             "realtime_ps3838",
             "GET",
-            "/api/v1/realtime/ps3838",
+            "/api/v1/{sport}/ps3838-realtime",
             "rest",
             "realtime",
             "stream_or_poll",
@@ -563,7 +563,7 @@ fn oddsentry_entries() -> Vec<SourceEndpointCatalogEntry> {
 fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
     vec![
         entry(
-            "fairodds",
+            "fair_odds",
             "value_calculated",
             "GET",
             "/api/value-calculated",
@@ -574,7 +574,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Primary EV/value feed with parameterized filters and joined drop enrichment.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "droppers",
             "GET",
             "/droppers?windowSec={windowSec}&sort=time&timing={timing}",
@@ -585,7 +585,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Observed live drop feed.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "pinn_events",
             "GET",
             "/api/pinn-events",
@@ -596,7 +596,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Event listing used by droppers flow.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "bg_stream",
             "GET",
             "/bg/stream",
@@ -607,7 +607,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Server-sent event trigger used to re-fetch value-calculated.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "sports_details",
             "GET",
             "/api/sports/details",
@@ -618,7 +618,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Sport metadata used by bets widget.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "books_allowed",
             "GET",
             "/api/books-allowed",
@@ -629,7 +629,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Exchange/sharp book allowlist.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "clv_compute",
             "POST",
             "/api/clv/compute",
@@ -640,7 +640,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "CLV recomputation for tracked bets.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "chat_ws",
             "WS",
             "/chat/ws",
@@ -651,7 +651,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Public chat websocket.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "chat_list",
             "GET",
             "/chat",
@@ -662,7 +662,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Chat fetch endpoint.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "chat_delete",
             "POST",
             "/chat/delete",
@@ -673,7 +673,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Chat delete endpoint.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "dm_conversations",
             "GET",
             "/dm/conversations",
@@ -684,7 +684,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "DM conversation list.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "dm_messages",
             "GET",
             "/dm/messages/{id}",
@@ -695,7 +695,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "DM message history.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "dm_user_search",
             "GET",
             "/dm/users/search?q={query}",
@@ -706,7 +706,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "DM user search.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "dm_start",
             "POST",
             "/dm/start",
@@ -717,7 +717,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Start DM conversation.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "dm_send",
             "POST",
             "/dm/send",
@@ -728,7 +728,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Send DM message.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "auth_user",
             "GET",
             "https://auth.fairoddsterminal.com/auth/v1/user",
@@ -739,7 +739,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Supabase auth user lookup.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rest_books",
             "GET",
             "https://auth.fairoddsterminal.com/rest/v1/books?select=id,name",
@@ -750,7 +750,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Books registry backing bets widget.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rest_bets",
             "GET",
             "https://auth.fairoddsterminal.com/rest/v1/bets?...",
@@ -761,7 +761,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Tracked bets listing from Supabase.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rest_bets_update",
             "PATCH",
             "https://auth.fairoddsterminal.com/rest/v1/bets",
@@ -772,7 +772,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Supabase update path inferred from bets widget.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rest_bets_delete",
             "DELETE",
             "https://auth.fairoddsterminal.com/rest/v1/bets",
@@ -783,7 +783,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Supabase delete path inferred from bets widget.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rest_user_settings_filters",
             "GET",
             "https://auth.fairoddsterminal.com/rest/v1/user_settings_filters",
@@ -794,7 +794,7 @@ fn fairodds_entries() -> Vec<SourceEndpointCatalogEntry> {
             "Watchlist/filter persistence.",
         ),
         entry(
-            "fairodds",
+            "fair_odds",
             "rpc_leaderboard_last_month",
             "POST",
             "https://auth.fairoddsterminal.com/rest/v1/rpc/leaderboard_last_month",
