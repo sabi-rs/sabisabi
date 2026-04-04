@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use super::models::{
-    MarketEventDetail, MarketHistoryPoint, MarketIntelSourceId, MarketOpportunityRow,
-    MarketQuoteComparisonRow, OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
+    EndpointSnapshot, MarketEventDetail, MarketHistoryPoint, MarketIntelSourceId,
+    MarketOpportunityRow, MarketQuoteComparisonRow, OpportunityKind, SourceHealth,
+    SourceHealthStatus, SourceLoadMode,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.oddsentry.com";
@@ -34,6 +35,7 @@ pub struct OddsentryDashboardSlice {
     pub arbitrages: Vec<MarketOpportunityRow>,
     pub plus_ev: Vec<MarketOpportunityRow>,
     pub event_detail: Option<MarketEventDetail>,
+    pub endpoint_snapshots: Vec<EndpointSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +224,33 @@ fn fixture_slice() -> Result<OddsentryDashboardSlice> {
             .map(|row| row.updated_at.as_str())
             .unwrap_or_default(),
     ]);
+    let endpoint_snapshots = vec![
+        fixture_snapshot("odds", "/v1/odds", &markets.body, &refreshed_at),
+        fixture_snapshot(
+            "arbitrages",
+            "/v1/arbitrages",
+            &arbitrages.body,
+            &refreshed_at,
+        ),
+        fixture_snapshot(
+            "positive_ev",
+            "/v1/positive_ev",
+            &plus_ev.body,
+            &refreshed_at,
+        ),
+        fixture_snapshot(
+            "event_detail",
+            "/v1/odds/e435b611c04885810e9923d7c33061ba",
+            &event_detail,
+            &refreshed_at,
+        ),
+        fixture_snapshot(
+            "historical_hourly",
+            "/v1/odds/e435b611c04885810e9923d7c33061ba/historical?resolution=hourly",
+            &history.body,
+            &refreshed_at,
+        ),
+    ];
 
     Ok(OddsentryDashboardSlice {
         health: SourceHealth {
@@ -240,21 +269,32 @@ fn fixture_slice() -> Result<OddsentryDashboardSlice> {
         arbitrages: arbitrage_rows,
         plus_ev: plus_ev_rows,
         event_detail: Some(event_detail),
+        endpoint_snapshots,
     })
 }
 
 fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDashboardSlice> {
     let base_url =
         env::var("ODDSENTRY_BASE_URL").unwrap_or_else(|_| String::from(DEFAULT_BASE_URL));
-    let markets: OddsentryMarketsResponse = get_json(client, auth, &format!("{base_url}/v1/odds"))?;
-    let arbitrages: OddsentryBetsResponse =
-        get_json(client, auth, &format!("{base_url}/v1/arbitrages"))?;
-    let plus_ev: OddsentryBetsResponse =
-        get_json(client, auth, &format!("{base_url}/v1/positive_ev"))?;
+    let markets_url = format!("{base_url}/v1/odds");
+    let (markets, markets_payload): (OddsentryMarketsResponse, serde_json::Value) =
+        get_json_with_payload(client, auth, &markets_url)?;
+    let arbitrages_url = format!("{base_url}/v1/arbitrages");
+    let (arbitrages, arbitrages_payload): (OddsentryBetsResponse, serde_json::Value) =
+        get_json_with_payload(client, auth, &arbitrages_url)?;
+    let plus_ev_url = format!("{base_url}/v1/positive_ev");
+    let (plus_ev, plus_ev_payload): (OddsentryBetsResponse, serde_json::Value) =
+        get_json_with_payload(client, auth, &plus_ev_url)?;
 
     let market_rows = build_market_rows(&markets.matches);
     let arbitrage_rows = build_arbitrage_rows(&arbitrages.bets);
     let plus_ev_rows = build_positive_ev_rows(&plus_ev.bets);
+
+    let mut endpoint_snapshots = vec![
+        live_snapshot("odds", markets_url, markets_payload),
+        live_snapshot("arbitrages", arbitrages_url, arbitrages_payload),
+        live_snapshot("positive_ev", plus_ev_url, plus_ev_payload),
+    ];
 
     let event_detail = markets
         .matches
@@ -262,13 +302,27 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
         .find(|event| !event.match_id.trim().is_empty())
         .map(|event| -> Result<MarketEventDetail> {
             let detail_url = format!("{base_url}/v1/odds/{}", event.match_id);
-            let detail: OddsentryEventDetailResponse = get_json(client, auth, &detail_url)?;
+            let (detail, detail_payload): (OddsentryEventDetailResponse, serde_json::Value) =
+                get_json_with_payload(client, auth, &detail_url)?;
             let history_url = format!(
                 "{base_url}/v1/odds/{}/historical?resolution=hourly",
                 event.match_id
             );
-            let history = get_json::<OddsentryHistoricalResponse>(client, auth, &history_url).ok();
-            Ok(build_event_detail(&detail, history.as_ref()))
+            let history =
+                get_json_with_payload::<OddsentryHistoricalResponse>(client, auth, &history_url)
+                    .ok();
+            endpoint_snapshots.push(live_snapshot("event_detail", detail_url, detail_payload));
+            if let Some((_, history_payload)) = history.as_ref() {
+                endpoint_snapshots.push(live_snapshot(
+                    "historical_hourly",
+                    history_url,
+                    history_payload.clone(),
+                ));
+            }
+            Ok(build_event_detail(
+                &detail,
+                history.as_ref().map(|(response, _)| response),
+            ))
         })
         .transpose()?;
     let refreshed_at = latest_updated_at(&[
@@ -303,14 +357,15 @@ fn fetch_live_slice(client: &Client, auth: &OddsentryAuth) -> Result<OddsentryDa
         arbitrages: arbitrage_rows,
         plus_ev: plus_ev_rows,
         event_detail,
+        endpoint_snapshots,
     })
 }
 
-fn get_json<T: for<'de> Deserialize<'de>>(
+fn get_json_with_payload<T: for<'de> Deserialize<'de>>(
     client: &Client,
     auth: &OddsentryAuth,
     url: &str,
-) -> Result<T> {
+) -> Result<(T, serde_json::Value)> {
     let response = client
         .get(url)
         .header("X-Oddsentry-User", &auth.user_id)
@@ -325,9 +380,43 @@ fn get_json<T: for<'de> Deserialize<'de>>(
     if !status.is_success() {
         return Err(anyhow!("{url} returned {status}"));
     }
-    response
-        .json::<T>()
-        .with_context(|| format!("failed to decode {url}"))
+    let payload = response
+        .json::<serde_json::Value>()
+        .with_context(|| format!("failed to decode raw payload for {url}"))?;
+    let typed = serde_json::from_value(payload.clone())
+        .with_context(|| format!("failed to decode typed payload for {url}"))?;
+    Ok((typed, payload))
+}
+
+fn fixture_snapshot<T: serde::Serialize>(
+    endpoint_key: &str,
+    requested_url: &str,
+    payload: &T,
+    captured_at: &str,
+) -> EndpointSnapshot {
+    EndpointSnapshot {
+        source: MarketIntelSourceId::Oddsentry,
+        endpoint_key: endpoint_key.to_string(),
+        requested_url: requested_url.to_string(),
+        capture_mode: SourceLoadMode::Fixture,
+        payload: serde_json::to_value(payload).unwrap_or_default(),
+        captured_at: captured_at.to_string(),
+    }
+}
+
+fn live_snapshot(
+    endpoint_key: &str,
+    requested_url: String,
+    payload: serde_json::Value,
+) -> EndpointSnapshot {
+    EndpointSnapshot {
+        source: MarketIntelSourceId::Oddsentry,
+        endpoint_key: endpoint_key.to_string(),
+        requested_url,
+        capture_mode: SourceLoadMode::Live,
+        payload,
+        captured_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 fn build_market_rows(matches: &[OddsentryMatch]) -> Vec<MarketOpportunityRow> {

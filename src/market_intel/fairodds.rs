@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::models::{
-    MarketIntelSourceId, MarketOpportunityRow, MarketQuoteComparisonRow, OpportunityKind,
+    DataSource, EndpointSnapshot, MarketOpportunityRow, MarketQuoteComparisonRow, OpportunityKind,
     SourceHealth, SourceHealthStatus, SourceLoadMode,
 };
 
@@ -14,6 +14,7 @@ pub struct FairOddsDashboardSlice {
     pub health: SourceHealth,
     pub drops: Vec<MarketOpportunityRow>,
     pub value: Vec<MarketOpportunityRow>,
+    pub endpoint_snapshots: Vec<EndpointSnapshot>,
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -98,10 +99,11 @@ pub fn load_dashboard_slice() -> Result<FairOddsDashboardSlice> {
         .enumerate()
         .map(|(index, row)| build_drop_row(index, row))
         .collect();
+    let captured_at = latest.captured_at_iso.clone();
 
     Ok(FairOddsDashboardSlice {
         health: SourceHealth {
-            source: MarketIntelSourceId::FairOdds,
+            source: DataSource::FairOdds,
             mode: SourceLoadMode::Fixture,
             status: SourceHealthStatus::Ready,
             detail: format!(
@@ -109,10 +111,28 @@ pub fn load_dashboard_slice() -> Result<FairOddsDashboardSlice> {
                 latest.row_count,
                 drops.len()
             ),
-            refreshed_at: latest.captured_at_iso,
+            refreshed_at: captured_at.clone(),
         },
         drops,
         value,
+        endpoint_snapshots: vec![
+            EndpointSnapshot {
+                source: DataSource::FairOdds,
+                endpoint_key: String::from("value_calculated"),
+                requested_url: String::from("/api/value-calculated"),
+                capture_mode: SourceLoadMode::Fixture,
+                payload: serde_json::to_value(&latest.top_rows).unwrap_or_default(),
+                captured_at: captured_at.clone(),
+            },
+            EndpointSnapshot {
+                source: DataSource::FairOdds,
+                endpoint_key: String::from("droppers"),
+                requested_url: String::from("/droppers?windowSec=300&sort=time&timing=prematch"),
+                capture_mode: SourceLoadMode::Fixture,
+                payload: serde_json::to_value(&latest.book_drops_sample).unwrap_or_default(),
+                captured_at,
+            },
+        ],
     })
 }
 
@@ -125,7 +145,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
         .unwrap_or_default();
     let mut quotes = Vec::new();
     quotes.push(MarketQuoteComparisonRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: DataSource::FairOdds,
         event_id: row.event_id.clone().unwrap_or_default(),
         market_id: String::new(),
         selection_id: String::new(),
@@ -147,7 +167,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
     });
     if let Some(fair_price) = row.effective_best_odds {
         quotes.push(MarketQuoteComparisonRow {
-            source: MarketIntelSourceId::FairOdds,
+            source: DataSource::FairOdds,
             event_id: row.event_id.clone().unwrap_or_default(),
             market_id: String::new(),
             selection_id: String::new(),
@@ -173,7 +193,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
     }
 
     MarketOpportunityRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: DataSource::FairOdds,
         kind: OpportunityKind::Value,
         id: format!("fairodds:value:{index}"),
         sport: row.sport_title.clone().unwrap_or_default(),
@@ -210,7 +230,7 @@ fn build_value_row(index: usize, row: &ValueRow) -> MarketOpportunityRow {
 fn build_drop_row(index: usize, row: &BookDropRow) -> MarketOpportunityRow {
     let updated_at = row.at.map(|value| value.to_string()).unwrap_or_default();
     let quotes = vec![MarketQuoteComparisonRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: DataSource::FairOdds,
         event_id: row.event_id.clone().unwrap_or_default(),
         market_id: String::new(),
         selection_id: String::new(),
@@ -232,7 +252,7 @@ fn build_drop_row(index: usize, row: &BookDropRow) -> MarketOpportunityRow {
     }];
 
     MarketOpportunityRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: DataSource::FairOdds,
         kind: OpportunityKind::Drop,
         id: format!("fairodds:drop:{index}"),
         sport: row.sport_title.clone().unwrap_or_default(),
