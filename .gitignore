@@ -1,2 +1,7 @@
 /target/
 /.env
+/data/
+/codemap.md
+/docs/plans/
+/src/**/codemap.md
+/tests/**/codemap.md
