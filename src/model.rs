@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Serialize)]
 pub struct WorkerStatus {
@@ -40,6 +41,49 @@ pub struct IngestLiveEventsRequest {
 #[derive(Serialize)]
 pub struct IngestLiveEventsResponse {
     pub accepted: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AuditTrailFilter {
+    #[serde(default)]
+    pub entity_type: String,
+    #[serde(default)]
+    pub entity_id: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub change_source: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default = "default_audit_limit")]
+    pub limit: i64,
+}
+
+fn default_audit_limit() -> i64 {
+    100
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, sqlx::FromRow)]
+pub struct AuditTrailItem {
+    pub batch_id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub action: String,
+    pub change_source: String,
+    pub actor: String,
+    pub request_id: String,
+    pub before_state: Option<Value>,
+    pub after_state: Option<Value>,
+    pub metadata: Value,
+    pub changed_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditTrailResponse {
+    pub filters: AuditTrailFilter,
+    pub items: Vec<AuditTrailItem>,
 }
 
 pub struct TestLiveEvent {

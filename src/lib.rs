@@ -1,3 +1,4 @@
+mod cache;
 mod error;
 mod market_intel;
 mod model;
@@ -15,9 +16,14 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use cache::HotCache;
 use error::{SabisabiError, ValidationError};
 use market_intel::{IngestMarketIntelResponse, MarketIntelDashboard, MarketIntelFilter};
-use model::{IngestLiveEventsRequest, IngestLiveEventsResponse, LiveEventsFilter, WorkerStatus};
+use model::{
+    AuditTrailFilter, AuditTrailResponse, IngestLiveEventsRequest, IngestLiveEventsResponse,
+    LiveEventsFilter, WorkerStatus,
+};
+use repository::audit::{AuditContext, AuditRepository};
 use repository::control::ControlRepository;
 use repository::live_events::LiveEventRepository;
 use repository::market_intel::MarketIntelRepository;
@@ -30,6 +36,7 @@ pub use model::TestLiveEvent;
 #[derive(Clone)]
 pub struct AppState {
     settings: Settings,
+    audit_repository: AuditRepository,
     control_repository: ControlRepository,
     live_event_repository: LiveEventRepository,
     market_intel_repository: MarketIntelRepository,
@@ -40,6 +47,9 @@ pub struct Settings {
     bind_address: String,
     control_token: Option<String>,
     database_url: String,
+    audit_retention_days: Option<i64>,
+    redis_url: Option<String>,
+    hot_cache_ttl_secs: u64,
     port: u16,
 }
 
@@ -49,6 +59,9 @@ impl Default for Settings {
             bind_address: String::from("127.0.0.1"),
             control_token: None,
             database_url: String::from("postgres://postgres:postgres@localhost:5432/sabisabi"),
+            audit_retention_days: Some(90),
+            redis_url: None,
+            hot_cache_ttl_secs: 120,
             port: 4080,
         }
     }
@@ -66,6 +79,18 @@ impl Settings {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             database_url: env::var("SABISABI_DATABASE_URL").unwrap_or(defaults.database_url),
+            audit_retention_days: env::var("SABISABI_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .or(defaults.audit_retention_days),
+            redis_url: env::var("SABISABI_REDIS_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            hot_cache_ttl_secs: env::var("SABISABI_HOT_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(defaults.hot_cache_ttl_secs),
             port: env::var("SABISABI_PORT")
                 .ok()
                 .and_then(|value| value.parse::<u16>().ok())
@@ -81,6 +106,21 @@ impl Settings {
     #[must_use]
     pub fn control_token(&self) -> Option<&str> {
         self.control_token.as_deref()
+    }
+
+    #[must_use]
+    pub fn redis_url(&self) -> Option<&str> {
+        self.redis_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn hot_cache_ttl_secs(&self) -> u64 {
+        self.hot_cache_ttl_secs
+    }
+
+    #[must_use]
+    pub fn audit_retention_days(&self) -> Option<i64> {
+        self.audit_retention_days
     }
 
     fn validate(&self) -> Result<()> {
@@ -126,19 +166,31 @@ impl AppState {
             .connect(&settings.database_url)
             .await
             .with_context(|| "failed to connect to postgres")?;
+        let hot_cache =
+            HotCache::from_redis_url(settings.redis_url(), settings.hot_cache_ttl_secs())
+                .await
+                .with_context(|| "failed to initialize redis hot cache")?;
 
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
             .with_context(|| "failed to run sabisabi migrations")?;
 
-        let control_repository = ControlRepository::postgres(pool.clone());
-        let live_event_repository = LiveEventRepository::postgres(pool.clone());
-        let market_intel_repository = MarketIntelRepository::postgres(pool);
+        let audit_repository = AuditRepository::postgres(pool.clone());
+        let control_repository =
+            ControlRepository::postgres(pool.clone(), settings.audit_retention_days());
+        let live_event_repository = LiveEventRepository::postgres(
+            pool.clone(),
+            hot_cache.clone(),
+            settings.audit_retention_days(),
+        );
+        let market_intel_repository =
+            MarketIntelRepository::postgres(pool, hot_cache, settings.audit_retention_days());
         control_repository.ensure_default_status().await?;
 
         Ok(Self {
             settings,
+            audit_repository,
             control_repository,
             live_event_repository,
             market_intel_repository,
@@ -159,6 +211,7 @@ impl AppState {
     ) -> Self {
         Self {
             settings,
+            audit_repository: AuditRepository::for_test(),
             control_repository: ControlRepository::for_test(),
             live_event_repository: LiveEventRepository::for_test(
                 live_events.into_iter().map(Into::into).collect(),
@@ -199,6 +252,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/query/live-events", get(query_live_events))
         .route(
+            "/api/v1/query/state-change-audit",
+            get(query_state_change_audit),
+        )
+        .route(
             "/api/v1/query/market-intel/dashboard",
             get(query_market_intel_dashboard),
         )
@@ -231,7 +288,11 @@ async fn control_start(
     headers: HeaderMap,
 ) -> Result<Json<ControlStatusResponse>, ApiError> {
     authorize_control_request(&state.settings, &headers)?;
-    let worker = state.control_repository.write_status("running").await?;
+    let audit = audit_context("api.control", &headers);
+    let worker = state
+        .control_repository
+        .write_status("running", &audit)
+        .await?;
     Ok(Json(ControlStatusResponse { worker }))
 }
 
@@ -240,7 +301,11 @@ async fn control_stop(
     headers: HeaderMap,
 ) -> Result<Json<ControlStatusResponse>, ApiError> {
     authorize_control_request(&state.settings, &headers)?;
-    let worker = state.control_repository.write_status("stopped").await?;
+    let audit = audit_context("api.control", &headers);
+    let worker = state
+        .control_repository
+        .write_status("stopped", &audit)
+        .await?;
     Ok(Json(ControlStatusResponse { worker }))
 }
 
@@ -262,13 +327,29 @@ fn authorize_control_request(settings: &Settings, headers: &HeaderMap) -> Result
     }
 }
 
+fn audit_context(actor: &str, headers: &HeaderMap) -> AuditContext {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    AuditContext {
+        actor: actor.to_string(),
+        request_id,
+    }
+}
+
 async fn ingest_live_events(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<IngestLiveEventsRequest>,
 ) -> Result<(StatusCode, Json<IngestLiveEventsResponse>), ApiError> {
+    let audit = audit_context("api.ingest_live_events", &headers);
     let accepted = state
         .live_event_repository
-        .upsert_live_events(&payload.items)
+        .upsert_live_events(&payload.items, &audit)
         .await?;
 
     Ok((
@@ -291,15 +372,25 @@ async fn query_live_events(
 
 async fn ingest_market_intel_refresh(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<IngestMarketIntelResponse>), ApiError> {
-    let dashboard = tokio::task::spawn_blocking(market_intel::load_dashboard)
+    let audit = audit_context("api.market_intel_refresh", &headers);
+    let bundle = tokio::task::spawn_blocking(market_intel::load_refresh_bundle)
         .await
         .context("failed to join market intel refresh task")??;
     let summary = state
         .market_intel_repository
-        .replace_dashboard(&dashboard)
+        .replace_dashboard(&bundle.dashboard, &bundle.endpoint_snapshots, &audit)
         .await?;
     Ok((StatusCode::ACCEPTED, Json(summary)))
+}
+
+async fn query_state_change_audit(
+    State(state): State<Arc<AppState>>,
+    Query(filters): Query<AuditTrailFilter>,
+) -> Result<Json<AuditTrailResponse>, ApiError> {
+    let items = state.audit_repository.read_audit_entries(&filters).await?;
+    Ok(Json(AuditTrailResponse { filters, items }))
 }
 
 async fn query_market_intel_dashboard(

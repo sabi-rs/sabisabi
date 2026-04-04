@@ -76,6 +76,30 @@ async fn live_events_query_endpoint_accepts_filters() {
 }
 
 #[tokio::test]
+async fn audit_query_endpoint_accepts_filters() {
+    let app = sabisabi::build_router_for_test();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/state-change-audit?entity_type=live_event&limit=25")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["filters"]["entity_type"], "live_event");
+    assert_eq!(json["filters"]["limit"], 25);
+    assert_eq!(json["items"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn control_start_endpoint_marks_worker_running() {
     let app = sabisabi::build_router_for_test();
 
@@ -163,6 +187,43 @@ async fn control_stop_endpoint_returns_worker_to_stopped() {
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["worker"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn control_start_requires_bearer_token_when_configured() {
+    let app = sabisabi::build_router_for_test_with_control_token("secret-token");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn control_start_accepts_matching_bearer_token() {
+    let app = sabisabi::build_router_for_test_with_control_token("secret-token");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control/start")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -323,4 +384,85 @@ async fn ingest_live_events_endpoint_rejects_duplicate_batch_without_partial_wri
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["items"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn market_intel_refresh_endpoint_persists_dashboard_for_query_api() {
+    let app = sabisabi::build_router_for_test();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/market-intel/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["leagues_updated"], 3);
+    assert!(json["opportunities_computed"].as_u64().unwrap() > 0);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/market-intel/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["sources"].as_array().unwrap().len(), 3);
+    assert!(!json["markets"].as_array().unwrap().is_empty());
+    assert!(!json["arbitrages"].as_array().unwrap().is_empty());
+    assert!(!json["plus_ev"].as_array().unwrap().is_empty());
+    assert!(!json["value"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn market_intel_query_endpoint_accepts_source_filter() {
+    let app = sabisabi::build_router_for_test();
+    let _response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingest/market-intel/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/market-intel/dashboard?source=fairodds")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(json["sources"][0]["source"], "fair_odds");
+    assert!(json["markets"].as_array().unwrap().is_empty());
+    assert!(json["plus_ev"].as_array().unwrap().is_empty());
+    assert!(!json["drops"].as_array().unwrap().is_empty());
+    assert!(!json["value"].as_array().unwrap().is_empty());
 }
