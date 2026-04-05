@@ -242,7 +242,17 @@ fn worker_config_payload(config: &RecorderConfig) -> Value {
 }
 
 fn parse_f64(value: &str, fallback: f64) -> f64 {
-    value.trim().parse::<f64>().unwrap_or(fallback)
+    let trimmed = value.trim();
+    trimmed.parse::<f64>().unwrap_or_else(|_| {
+        if !trimmed.is_empty() {
+            tracing::warn!(
+                value = trimmed,
+                fallback,
+                "failed to parse numeric recorder config value"
+            );
+        }
+        fallback
+    })
 }
 
 fn parse_optional_f64(value: &str) -> Option<f64> {
@@ -279,7 +289,9 @@ fn read_stream<R: std::io::Read>(mut reader: R) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperatorSnapshotAction, OperatorSnapshotControlRequest, worker_config_payload};
+    use super::{
+        OperatorSnapshotAction, OperatorSnapshotControlRequest, parse_f64, worker_config_payload,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -316,5 +328,11 @@ mod tests {
             })
             .expect_err("missing venue should fail");
         assert!(error.to_string().contains("select_venue requires venue"));
+    }
+
+    #[test]
+    fn parse_f64_returns_fallback_for_invalid_values() {
+        assert_eq!(parse_f64("abc", 1.25), 1.25);
+        assert_eq!(parse_f64("", 0.5), 0.5);
     }
 }

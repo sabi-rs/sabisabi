@@ -8,13 +8,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MatchbookMonitorConfig {
     pub base_url: String,
     pub session_token: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub cache_ttl: Duration,
+}
+
+impl std::fmt::Debug for MatchbookMonitorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatchbookMonitorConfig")
+            .field("base_url", &self.base_url)
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("cache_ttl", &self.cache_ttl)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -133,36 +148,39 @@ impl MatchbookMonitorService {
             return Err(anyhow!("Matchbook monitor is not configured"));
         };
 
-        let mut state = self.state.lock().await;
-        if !force_refresh {
-            if let Some(cached) = state.cached.as_ref() {
-                if cached.fetched_at.elapsed() < config.cache_ttl {
-                    return Ok(cached.state.clone());
+        let client = {
+            let mut state = self.state.lock().await;
+            if !force_refresh {
+                if let Some(cached) = state.cached.as_ref() {
+                    if cached.fetched_at.elapsed() < config.cache_ttl {
+                        return Ok(cached.state.clone());
+                    }
                 }
             }
-        }
 
-        if let Some(until) = state.rate_limited_until {
-            if Instant::now() < until {
-                let remaining_secs = until.saturating_duration_since(Instant::now()).as_secs();
-                return Err(anyhow!(
-                    "Matchbook API remains rate limited; retry after {}s",
-                    remaining_secs
-                ));
+            if let Some(until) = state.rate_limited_until {
+                if Instant::now() < until {
+                    let remaining_secs = until.saturating_duration_since(Instant::now()).as_secs();
+                    return Err(anyhow!(
+                        "Matchbook API remains rate limited; retry after {}s",
+                        remaining_secs
+                    ));
+                }
+                state.rate_limited_until = None;
             }
-            state.rate_limited_until = None;
-        }
 
-        if state.client.is_none() {
-            state.client = Some(AsyncMatchbookApiClient::new(config.as_ref()).await?);
-        }
+            state.client.clone()
+        };
 
-        match load_matchbook_account_state_with_async_client(
-            state.client.as_ref().expect("client initialized"),
-        )
-        .await
-        {
+        let client = match client {
+            Some(client) => client,
+            None => AsyncMatchbookApiClient::new(config.as_ref()).await?,
+        };
+
+        match load_matchbook_account_state_with_async_client(&client).await {
             Ok(account_state) => {
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
                 state.cached = Some(CachedState {
                     state: account_state.clone(),
                     fetched_at: Instant::now(),
@@ -170,11 +188,12 @@ impl MatchbookMonitorService {
                 Ok(account_state)
             }
             Err(error) if matchbook_error_has_status(&error, 401) => {
-                state.client = Some(AsyncMatchbookApiClient::new(config.as_ref()).await?);
-                let account_state = load_matchbook_account_state_with_async_client(
-                    state.client.as_ref().expect("client refreshed"),
-                )
-                .await?;
+                let refreshed_client = AsyncMatchbookApiClient::new(config.as_ref()).await?;
+                let account_state =
+                    load_matchbook_account_state_with_async_client(&refreshed_client).await?;
+                let mut state = self.state.lock().await;
+                state.client = Some(refreshed_client);
+                state.rate_limited_until = None;
                 state.cached = Some(CachedState {
                     state: account_state.clone(),
                     fetched_at: Instant::now(),
@@ -182,11 +201,16 @@ impl MatchbookMonitorService {
                 Ok(account_state)
             }
             Err(error) if matchbook_error_has_status(&error, 429) => {
+                let mut state = self.state.lock().await;
                 state.client = None;
                 state.rate_limited_until = Some(Instant::now() + Duration::from_secs(10 * 60));
                 Err(error)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
+                Err(error)
+            }
         }
     }
 }
@@ -686,7 +710,9 @@ fn row_matches_runner_id(value: &Value, runner_id: &str) -> bool {
 
 fn first_non_empty_string(value: &Value, paths: &[&str]) -> Option<String> {
     for path in paths {
-        let current = value.pointer(path)?;
+        let Some(current) = value.pointer(path) else {
+            continue;
+        };
         let as_text = match current {
             Value::String(item) => item.trim().to_string(),
             Value::Number(item) => item.to_string(),
@@ -702,7 +728,9 @@ fn first_non_empty_string(value: &Value, paths: &[&str]) -> Option<String> {
 
 fn first_numeric(value: &Value, paths: &[&str]) -> Option<f64> {
     for path in paths {
-        let current = value.pointer(path)?;
+        let Some(current) = value.pointer(path) else {
+            continue;
+        };
         let parsed = match current {
             Value::Number(item) => item.as_f64(),
             Value::String(item) => item.trim().parse::<f64>().ok(),
@@ -774,7 +802,11 @@ fn truncate(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         value.to_string()
     } else {
-        format!("{}...", &value[..limit.saturating_sub(3)])
+        let prefix = value
+            .chars()
+            .take(limit.saturating_sub(3))
+            .collect::<String>();
+        format!("{prefix}...")
     }
 }
 
