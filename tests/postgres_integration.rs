@@ -214,7 +214,7 @@ async fn postgres_path_persists_market_intel_refresh_for_query() {
     );
 
     let fair_odds_value_path: Option<String> = sqlx::query_scalar(
-        "SELECT path_template FROM market_source_endpoints WHERE provider = 'fairodds' AND endpoint_key = 'value_calculated'",
+        "SELECT path_template FROM market_source_endpoints WHERE provider = 'fair_odds' AND endpoint_key = 'value_calculated'",
     )
     .fetch_optional(&mut verify_connection)
     .await

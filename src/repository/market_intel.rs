@@ -1142,16 +1142,13 @@ fn parse_snapshot_timestamp(value: &str) -> DateTime<Utc> {
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
         .or_else(|| {
-            trimmed
-                .parse::<i64>()
-                .ok()
-                .and_then(|raw| {
-                    if raw >= 1_000_000_000_000 {
-                        Utc.timestamp_millis_opt(raw).single()
-                    } else {
-                        Utc.timestamp_opt(raw, 0).single()
-                    }
-                })
+            trimmed.parse::<i64>().ok().and_then(|raw| {
+                if raw >= 1_000_000_000_000 {
+                    Utc.timestamp_millis_opt(raw).single()
+                } else {
+                    Utc.timestamp_opt(raw, 0).single()
+                }
+            })
         })
         .unwrap_or_else(Utc::now)
 }

@@ -427,11 +427,7 @@ fn source_rank_meta(
         health.and_then(|value| value.requests_remaining),
         policy.reserve_requests_remaining,
     ) {
-        if remaining <= reserve {
-            1
-        } else {
-            0
-        }
+        if remaining <= reserve { 1 } else { 0 }
     } else {
         0
     };
@@ -836,8 +832,10 @@ mod tests {
         let snapshot = build_sport_league_first(&dashboard, &dashboard.source_policies);
         assert_eq!(snapshot.leagues.len(), 1);
         assert_eq!(snapshot.leagues[0].primary_source, DataSource::oddsentry());
-        assert!(snapshot.leagues[0]
-            .primary_selection_reason
-            .contains("selected=oddsentry"));
+        assert!(
+            snapshot.leagues[0]
+                .primary_selection_reason
+                .contains("selected=oddsentry")
+        );
     }
 }

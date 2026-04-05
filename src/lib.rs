@@ -1,7 +1,9 @@
 mod cache;
 mod error;
+mod execution;
 mod market_intel;
 mod model;
+mod operator;
 mod owls;
 mod repository;
 
@@ -12,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -20,7 +22,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cache::HotCache;
 use error::{SabisabiError, ValidationError};
-use market_intel::{IngestMarketIntelResponse, MarketIntelDashboard, MarketIntelFilter};
+use market_intel::{IngestMarketIntelResponse, MarketIntelFilter};
 use model::{
     AuditTrailFilter, AuditTrailResponse, IngestLiveEventsRequest, IngestLiveEventsResponse,
     LiveEventItem, LiveEventsFilter, WorkerStatus,
@@ -33,13 +35,26 @@ use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+pub use execution::{
+    AdhocExecutionRequest, ExecutionPlanEnvelope, ExecutionReviewRequest, ExecutionReviewResponse,
+    ExecutionSubmitRequest, ExecutionSubmitResponse,
+};
+pub use market_intel::models::{
+    DataSource, MarketIntelDashboard, MarketOpportunityRow, MarketQuoteComparisonRow,
+    OpportunityKind,
+};
 pub use model::TestLiveEvent;
+pub use operator::{
+    ExecutionPlan, MatchOpportunity, OperatorActiveFilter, OperatorActiveResponse,
+    StrategyRecommendation,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     settings: Settings,
     audit_repository: AuditRepository,
     control_repository: ControlRepository,
+    execution_service: execution::ExecutionService,
     live_event_repository: LiveEventRepository,
     market_intel_repository: MarketIntelRepository,
 }
@@ -54,6 +69,10 @@ pub struct Settings {
     owls_base_url: String,
     owls_realtime_sports: Vec<String>,
     owls_realtime_idle_reconnect_secs: u64,
+    matchbook_session_token: Option<String>,
+    matchbook_username: Option<String>,
+    matchbook_password: Option<String>,
+    matchbook_base_url: String,
     redis_url: Option<String>,
     hot_cache_ttl_secs: u64,
     port: u16,
@@ -77,6 +96,10 @@ impl Default for Settings {
                 String::from("mlb"),
             ],
             owls_realtime_idle_reconnect_secs: 30,
+            matchbook_session_token: None,
+            matchbook_username: None,
+            matchbook_password: None,
+            matchbook_base_url: String::from("https://api.matchbook.com"),
             redis_url: None,
             hot_cache_ttl_secs: 120,
             port: 4080,
@@ -103,7 +126,12 @@ impl Settings {
             owls_api_key: env::var("SABISABI_OWLS_API_KEY")
                 .ok()
                 .or_else(|| env::var("OWLS_INSIGHT_API_KEY").ok())
-                .or_else(load_owls_api_key_from_dotenv_candidates)
+                .or_else(|| {
+                    load_env_value_from_dotenv_candidates(&[
+                        "OWLS_INSIGHT_API_KEY",
+                        "OWLSINSIGHT_API_KEY",
+                    ])
+                })
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             owls_base_url: env::var("SABISABI_OWLS_BASE_URL").unwrap_or(defaults.owls_base_url),
@@ -125,6 +153,41 @@ impl Settings {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(defaults.owls_realtime_idle_reconnect_secs),
+            matchbook_session_token: env::var("SABISABI_MATCHBOOK_SESSION_TOKEN")
+                .ok()
+                .or_else(|| env::var("MATCHBOOK_SESSION_TOKEN").ok())
+                .or_else(|| {
+                    load_env_value_from_dotenv_candidates(&[
+                        "SABISABI_MATCHBOOK_SESSION_TOKEN",
+                        "MATCHBOOK_SESSION_TOKEN",
+                    ])
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            matchbook_username: env::var("SABISABI_MATCHBOOK_USERNAME")
+                .ok()
+                .or_else(|| env::var("MATCHBOOK_USERNAME").ok())
+                .or_else(|| {
+                    load_env_value_from_dotenv_candidates(&[
+                        "SABISABI_MATCHBOOK_USERNAME",
+                        "MATCHBOOK_USERNAME",
+                    ])
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            matchbook_password: env::var("SABISABI_MATCHBOOK_PASSWORD")
+                .ok()
+                .or_else(|| env::var("MATCHBOOK_PASSWORD").ok())
+                .or_else(|| {
+                    load_env_value_from_dotenv_candidates(&[
+                        "SABISABI_MATCHBOOK_PASSWORD",
+                        "MATCHBOOK_PASSWORD",
+                    ])
+                })
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            matchbook_base_url: env::var("SABISABI_MATCHBOOK_BASE_URL")
+                .unwrap_or(defaults.matchbook_base_url),
             redis_url: env::var("SABISABI_REDIS_URL")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -198,7 +261,7 @@ impl Settings {
     }
 }
 
-fn load_owls_api_key_from_dotenv_candidates() -> Option<String> {
+fn load_env_value_from_dotenv_candidates(keys: &[&str]) -> Option<String> {
     for path in dotenv_candidates() {
         if !path.is_file() {
             continue;
@@ -207,7 +270,7 @@ fn load_owls_api_key_from_dotenv_candidates() -> Option<String> {
             continue;
         };
         for line in content.lines() {
-            if let Some(parsed) = parse_owls_api_key_from_line(line) {
+            if let Some(parsed) = parse_env_value_from_line(line, keys) {
                 return Some(parsed);
             }
         }
@@ -215,7 +278,7 @@ fn load_owls_api_key_from_dotenv_candidates() -> Option<String> {
     None
 }
 
-fn parse_owls_api_key_from_line(line: &str) -> Option<String> {
+fn parse_env_value_from_line(line: &str, keys: &[&str]) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -223,7 +286,7 @@ fn parse_owls_api_key_from_line(line: &str) -> Option<String> {
 
     let candidate = trimmed.strip_prefix("export ").unwrap_or(trimmed);
     let (key, value) = candidate.split_once('=')?;
-    if !matches!(key.trim(), "OWLS_INSIGHT_API_KEY" | "OWLSINSIGHT_API_KEY") {
+    if !keys.iter().any(|expected| key.trim() == *expected) {
         return None;
     }
 
@@ -287,39 +350,55 @@ impl AppState {
         );
         let market_intel_repository =
             MarketIntelRepository::postgres(pool, hot_cache, settings.audit_retention_days());
+        let execution_service = settings.execution_service()?;
         control_repository.ensure_default_status().await?;
 
         Ok(Self {
             settings,
             audit_repository,
             control_repository,
+            execution_service,
             live_event_repository,
             market_intel_repository,
         })
     }
 
     fn for_test() -> Self {
-        Self::for_test_with_live_events(Vec::new())
+        Self::for_test_with_live_events_and_dashboard(Vec::new(), MarketIntelDashboard::default())
     }
 
     fn for_test_with_live_events(live_events: Vec<TestLiveEvent>) -> Self {
-        Self::for_test_with_live_events_and_settings(live_events, Settings::default())
+        Self::for_test_with_live_events_and_dashboard(live_events, MarketIntelDashboard::default())
     }
 
-    fn for_test_with_live_events_and_settings(
+    fn for_test_with_live_events_and_dashboard(
         live_events: Vec<TestLiveEvent>,
+        dashboard: MarketIntelDashboard,
+    ) -> Self {
+        Self::for_test_with_live_events_dashboard_and_settings(
+            live_events,
+            dashboard,
+            Settings::default(),
+        )
+    }
+
+    fn for_test_with_live_events_dashboard_and_settings(
+        live_events: Vec<TestLiveEvent>,
+        dashboard: MarketIntelDashboard,
         settings: Settings,
     ) -> Self {
         Self {
             settings,
             audit_repository: AuditRepository::for_test(),
             control_repository: ControlRepository::for_test(),
+            execution_service: execution::ExecutionService::VenueGateways {
+                matchbook: Arc::new(execution::StubMatchbookGateway),
+                betfair: Arc::new(execution::StubBetfairGateway),
+            },
             live_event_repository: LiveEventRepository::for_test(
                 live_events.into_iter().map(Into::into).collect(),
             ),
-            market_intel_repository: MarketIntelRepository::for_test(
-                MarketIntelDashboard::default(),
-            ),
+            market_intel_repository: MarketIntelRepository::for_test(dashboard),
         }
     }
 
@@ -345,6 +424,29 @@ impl AppState {
             .await?;
         Ok(())
     }
+
+    pub(crate) async fn find_operator_match(
+        &self,
+        match_id: &str,
+    ) -> Result<MatchOpportunity, ApiError> {
+        let dashboard = self
+            .market_intel_repository
+            .read_dashboard(&MarketIntelFilter::default())
+            .await?;
+        let live_events = self
+            .live_event_repository
+            .read_live_events(&LiveEventsFilter::default())
+            .await?;
+        operator::build_active_matches(&OperatorActiveFilter::default(), &dashboard, &live_events)
+            .into_iter()
+            .find(|item| item.id == match_id)
+            .ok_or_else(|| {
+                ApiError::Validation(ValidationError::invalid(
+                    "match_id",
+                    format!("unknown match opportunity: {match_id}"),
+                ))
+            })
+    }
 }
 
 impl Settings {
@@ -361,6 +463,37 @@ impl Settings {
             idle_reconnect_secs: self.owls_realtime_idle_reconnect_secs,
         })
     }
+
+    fn execution_service(&self) -> Result<execution::ExecutionService> {
+        if let Some(config) = self.matchbook_config() {
+            Ok(execution::ExecutionService::VenueGateways {
+                matchbook: Arc::new(execution::LiveMatchbookGateway::new(config)?),
+                betfair: Arc::new(execution::StubBetfairGateway),
+            })
+        } else {
+            Ok(execution::ExecutionService::VenueGateways {
+                matchbook: Arc::new(execution::StubMatchbookGateway),
+                betfair: Arc::new(execution::StubBetfairGateway),
+            })
+        }
+    }
+
+    fn matchbook_config(&self) -> Option<execution::MatchbookConfig> {
+        Some(execution::MatchbookConfig {
+            base_url: self.matchbook_base_url.clone(),
+            session_token: self.matchbook_session_token.clone(),
+            session_cache_path: matchbook_session_cache_path(),
+            username: self.matchbook_username.clone()?,
+            password: self.matchbook_password.clone()?,
+        })
+    }
+}
+
+fn matchbook_session_cache_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("sabisabi").join("matchbook-session.json"))
 }
 
 pub fn spawn_background_tasks(state: Arc<AppState>) {
@@ -375,11 +508,23 @@ pub fn build_router_for_test_with_live_events(events: Vec<TestLiveEvent>) -> Rou
     build_router(Arc::new(AppState::for_test_with_live_events(events)))
 }
 
-pub fn build_router_for_test_with_control_token(control_token: impl Into<String>) -> Router {
-    build_router(Arc::new(AppState::for_test_with_live_events_and_settings(
-        Vec::new(),
-        Settings::default().with_control_token(control_token),
+pub fn build_router_for_test_with_live_events_and_dashboard(
+    events: Vec<TestLiveEvent>,
+    dashboard: MarketIntelDashboard,
+) -> Router {
+    build_router(Arc::new(AppState::for_test_with_live_events_and_dashboard(
+        events, dashboard,
     )))
+}
+
+pub fn build_router_for_test_with_control_token(control_token: impl Into<String>) -> Router {
+    build_router(Arc::new(
+        AppState::for_test_with_live_events_dashboard_and_settings(
+            Vec::new(),
+            MarketIntelDashboard::default(),
+            Settings::default().with_control_token(control_token),
+        ),
+    ))
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -402,6 +547,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/query/market-intel/dashboard",
             get(query_market_intel_dashboard),
+        )
+        .route("/api/v1/query/operator/active", get(query_operator_active))
+        .route(
+            "/api/v1/query/execution/plan/{match_id}",
+            get(query_execution_plan),
+        )
+        .route("/api/v1/execution/review", post(review_execution_plan))
+        .route("/api/v1/execution/submit", post(submit_execution_plan))
+        .route(
+            "/api/v1/execution/ad-hoc/review",
+            post(review_execution_adhoc),
+        )
+        .route(
+            "/api/v1/execution/ad-hoc/submit",
+            post(submit_execution_adhoc),
         )
         .layer(CorsLayer::new().allow_methods([Method::GET, Method::POST]))
         .layer(TraceLayer::new_for_http())
@@ -546,6 +706,101 @@ async fn query_market_intel_dashboard(
         .read_dashboard(&filter)
         .await?;
     Ok(Json(dashboard))
+}
+
+async fn query_operator_active(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<OperatorActiveFilter>,
+) -> Result<Json<OperatorActiveResponse>, ApiError> {
+    let sport = if filter.sport.trim().is_empty() {
+        String::new()
+    } else {
+        filter.sport.trim().to_string()
+    };
+    let dashboard_sport = operator::dashboard_sport_key_for_filter(&sport);
+    let dashboard = state
+        .market_intel_repository
+        .read_dashboard(&MarketIntelFilter {
+            sport_key: dashboard_sport,
+            ..MarketIntelFilter::default()
+        })
+        .await?;
+    let live_events = state
+        .live_event_repository
+        .read_live_events(&LiveEventsFilter {
+            sport: operator::live_events_sport_key_for_filter(&sport),
+            source: String::new(),
+        })
+        .await?;
+
+    Ok(Json(operator::build_operator_active_response(
+        &filter,
+        &dashboard,
+        &live_events,
+    )))
+}
+
+async fn query_execution_plan(
+    State(state): State<Arc<AppState>>,
+    Path(match_id): Path<String>,
+) -> Result<Json<ExecutionPlanEnvelope>, ApiError> {
+    let opportunity = state.find_operator_match(&match_id).await?;
+    let envelope = state
+        .execution_service
+        .plan_for_match(opportunity)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(envelope))
+}
+
+async fn review_execution_plan(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ExecutionReviewRequest>,
+) -> Result<Json<ExecutionReviewResponse>, ApiError> {
+    let opportunity = state.find_operator_match(&request.match_id).await?;
+    let response = state
+        .execution_service
+        .review_match(opportunity, request.stake)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn submit_execution_plan(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ExecutionSubmitRequest>,
+) -> Result<Json<ExecutionSubmitResponse>, ApiError> {
+    let opportunity = state.find_operator_match(&request.match_id).await?;
+    let response = state
+        .execution_service
+        .submit_match(opportunity, request.stake)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn review_execution_adhoc(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AdhocExecutionRequest>,
+) -> Result<Json<ExecutionReviewResponse>, ApiError> {
+    let response = state
+        .execution_service
+        .review_adhoc(request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+async fn submit_execution_adhoc(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AdhocExecutionRequest>,
+) -> Result<Json<ExecutionSubmitResponse>, ApiError> {
+    let response = state
+        .execution_service
+        .submit_adhoc(request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
 }
 
 enum ApiError {

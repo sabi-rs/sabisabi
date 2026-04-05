@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 

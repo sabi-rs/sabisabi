@@ -100,6 +100,357 @@ async fn audit_query_endpoint_accepts_filters() {
 }
 
 #[tokio::test]
+async fn operator_active_endpoint_returns_ranked_matches() {
+    let app = sabisabi::build_router_for_test_with_live_events_and_dashboard(
+        vec![sabisabi::TestLiveEvent {
+            event_id: String::from("event-1"),
+            source: String::from("owls"),
+            sport: String::from("soccer"),
+            home_team: String::from("Arsenal"),
+            away_team: String::from("Everton"),
+            status: String::from("72:00"),
+        }],
+        sabisabi::MarketIntelDashboard {
+            refreshed_at: String::from("2026-04-05T12:00:00Z"),
+            arbitrages: vec![sabisabi::MarketOpportunityRow {
+                source: sabisabi::DataSource::oddsentry(),
+                kind: sabisabi::OpportunityKind::Arbitrage,
+                id: String::from("arb-1"),
+                sport: String::from("soccer"),
+                competition_name: String::from("Premier League"),
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal vs Everton"),
+                market_name: String::from("Full-time result"),
+                selection_name: String::from("Arsenal"),
+                secondary_selection_name: String::new(),
+                venue: String::from("matchbook"),
+                secondary_venue: String::from("betfair"),
+                price: Some(2.1),
+                secondary_price: Some(2.2),
+                fair_price: Some(2.0),
+                liquidity: Some(1000.0),
+                edge_percent: Some(1.6),
+                arbitrage_margin: Some(0.8),
+                stake_hint: Some(25.0),
+                start_time: String::from("2026-04-05T14:00:00Z"),
+                updated_at: String::from("2026-04-05T12:00:00Z"),
+                event_url: String::new(),
+                deep_link_url: String::from("https://matchbook.example/market"),
+                is_live: true,
+                quotes: vec![sabisabi::MarketQuoteComparisonRow {
+                    source: sabisabi::DataSource::oddsentry(),
+                    event_id: String::from("event-1"),
+                    market_id: String::from("mkt-1"),
+                    selection_id: String::from("sel-1"),
+                    event_name: String::from("Arsenal vs Everton"),
+                    market_name: String::from("Full-time result"),
+                    selection_name: String::from("Arsenal"),
+                    side: String::from("back"),
+                    venue: String::from("matchbook"),
+                    price: Some(2.1),
+                    fair_price: Some(2.0),
+                    liquidity: Some(1000.0),
+                    event_url: String::new(),
+                    deep_link_url: String::from("https://matchbook.example/market"),
+                    updated_at: String::from("2026-04-05T12:00:00Z"),
+                    is_live: true,
+                    is_sharp: true,
+                    notes: Vec::new(),
+                    raw_data: serde_json::Value::Null,
+                }],
+                notes: Vec::new(),
+                raw_data: serde_json::Value::Null,
+            }],
+            ..sabisabi::MarketIntelDashboard::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/operator/active?sport=soccer&live_only=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["summary"]["total_matches"], 1);
+    assert_eq!(json["matches"][0]["event_name"], "Arsenal vs Everton");
+    assert_eq!(
+        json["matches"][0]["execution_plan"]["executor"],
+        "matchbook"
+    );
+    assert_eq!(json["matches"][0]["strategy"]["action"], "enter");
+    assert_eq!(json["matches"][0]["canonical"]["event"]["id"], "event-1");
+    assert_eq!(
+        json["matches"][0]["venue_mappings"][0]["market_ref"],
+        "mkt-1"
+    );
+}
+
+#[tokio::test]
+async fn execution_plan_endpoint_returns_gateway_plan() {
+    let app = sabisabi::build_router_for_test_with_live_events_and_dashboard(
+        vec![sabisabi::TestLiveEvent {
+            event_id: String::from("event-1"),
+            source: String::from("owls"),
+            sport: String::from("soccer"),
+            home_team: String::from("Arsenal"),
+            away_team: String::from("Everton"),
+            status: String::from("72:00"),
+        }],
+        sabisabi::MarketIntelDashboard {
+            refreshed_at: String::from("2026-04-05T12:00:00Z"),
+            arbitrages: vec![sabisabi::MarketOpportunityRow {
+                source: sabisabi::DataSource::oddsentry(),
+                kind: sabisabi::OpportunityKind::Arbitrage,
+                id: String::from("arb-1"),
+                sport: String::from("soccer"),
+                competition_name: String::from("Premier League"),
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal vs Everton"),
+                market_name: String::from("Full-time result"),
+                selection_name: String::from("Arsenal"),
+                secondary_selection_name: String::new(),
+                venue: String::from("matchbook"),
+                secondary_venue: String::from("betfair"),
+                price: Some(2.1),
+                secondary_price: Some(2.2),
+                fair_price: Some(2.0),
+                liquidity: Some(1000.0),
+                edge_percent: Some(1.6),
+                arbitrage_margin: Some(0.8),
+                stake_hint: Some(25.0),
+                start_time: String::from("2026-04-05T14:00:00Z"),
+                updated_at: String::from("2026-04-05T12:00:00Z"),
+                event_url: String::from("https://matchbook.example/event"),
+                deep_link_url: String::from("https://matchbook.example/market"),
+                is_live: true,
+                quotes: vec![sabisabi::MarketQuoteComparisonRow {
+                    source: sabisabi::DataSource::oddsentry(),
+                    event_id: String::from("event-1"),
+                    market_id: String::from("mkt-1"),
+                    selection_id: String::from("sel-1"),
+                    event_name: String::from("Arsenal vs Everton"),
+                    market_name: String::from("Full-time result"),
+                    selection_name: String::from("Arsenal"),
+                    side: String::from("back"),
+                    venue: String::from("matchbook"),
+                    price: Some(2.1),
+                    fair_price: Some(2.0),
+                    liquidity: Some(1000.0),
+                    event_url: String::from("https://matchbook.example/event"),
+                    deep_link_url: String::from("https://matchbook.example/market"),
+                    updated_at: String::from("2026-04-05T12:00:00Z"),
+                    is_live: true,
+                    is_sharp: true,
+                    notes: Vec::new(),
+                    raw_data: serde_json::Value::Null,
+                }],
+                notes: Vec::new(),
+                raw_data: serde_json::Value::Null,
+            }],
+            ..sabisabi::MarketIntelDashboard::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/query/execution/plan/arb-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["gateway"]["kind"], "matchbook");
+    assert_eq!(json["plan"]["primary"]["venue"], "matchbook");
+    assert_eq!(json["opportunity"]["id"], "arb-1");
+    assert_eq!(
+        json["opportunity"]["venue_mappings"][0]["selection_ref"],
+        "sel-1"
+    );
+}
+
+#[tokio::test]
+async fn execution_review_endpoint_returns_stub_preview() {
+    let app = sabisabi::build_router_for_test_with_live_events_and_dashboard(
+        Vec::new(),
+        sabisabi::MarketIntelDashboard {
+            refreshed_at: String::from("2026-04-05T12:00:00Z"),
+            plus_ev: vec![sabisabi::MarketOpportunityRow {
+                source: sabisabi::DataSource::oddsentry(),
+                kind: sabisabi::OpportunityKind::PositiveEv,
+                id: String::from("ev-1"),
+                sport: String::from("soccer"),
+                competition_name: String::from("Premier League"),
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal vs Everton"),
+                market_name: String::from("BTTS"),
+                selection_name: String::from("Yes"),
+                secondary_selection_name: String::new(),
+                venue: String::from("matchbook"),
+                secondary_venue: String::new(),
+                price: Some(1.91),
+                secondary_price: None,
+                fair_price: Some(1.78),
+                liquidity: Some(200.0),
+                edge_percent: Some(7.3),
+                arbitrage_margin: None,
+                stake_hint: Some(10.0),
+                start_time: String::from("2026-04-05T14:00:00Z"),
+                updated_at: String::from("2026-04-05T12:00:00Z"),
+                event_url: String::from("https://matchbook.example/event"),
+                deep_link_url: String::from("https://matchbook.example/market"),
+                is_live: false,
+                quotes: vec![sabisabi::MarketQuoteComparisonRow {
+                    source: sabisabi::DataSource::oddsentry(),
+                    event_id: String::from("event-1"),
+                    market_id: String::from("mkt-1"),
+                    selection_id: String::from("sel-1"),
+                    event_name: String::from("Arsenal vs Everton"),
+                    market_name: String::from("BTTS"),
+                    selection_name: String::from("Yes"),
+                    side: String::from("back"),
+                    venue: String::from("matchbook"),
+                    price: Some(1.91),
+                    fair_price: Some(1.78),
+                    liquidity: Some(200.0),
+                    event_url: String::from("https://matchbook.example/event"),
+                    deep_link_url: String::from("https://matchbook.example/market"),
+                    updated_at: String::from("2026-04-05T12:00:00Z"),
+                    is_live: false,
+                    is_sharp: true,
+                    notes: Vec::new(),
+                    raw_data: serde_json::Value::Null,
+                }],
+                notes: Vec::new(),
+                raw_data: serde_json::Value::Null,
+            }],
+            ..sabisabi::MarketIntelDashboard::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/execution/review")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"match_id": "ev-1", "stake": 12.5}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["gateway"]["mode"], "stub");
+    assert_eq!(json["review"]["stake"], 12.5);
+    assert_eq!(json["review"]["executable"], false);
+}
+
+#[tokio::test]
+async fn execution_submit_endpoint_returns_stub_result() {
+    let app = sabisabi::build_router_for_test_with_live_events_and_dashboard(
+        Vec::new(),
+        sabisabi::MarketIntelDashboard {
+            refreshed_at: String::from("2026-04-05T12:00:00Z"),
+            plus_ev: vec![sabisabi::MarketOpportunityRow {
+                source: sabisabi::DataSource::oddsentry(),
+                kind: sabisabi::OpportunityKind::PositiveEv,
+                id: String::from("ev-1"),
+                sport: String::from("soccer"),
+                competition_name: String::from("Premier League"),
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal vs Everton"),
+                market_name: String::from("BTTS"),
+                selection_name: String::from("Yes"),
+                secondary_selection_name: String::new(),
+                venue: String::from("matchbook"),
+                secondary_venue: String::new(),
+                price: Some(1.91),
+                secondary_price: None,
+                fair_price: Some(1.78),
+                liquidity: Some(200.0),
+                edge_percent: Some(7.3),
+                arbitrage_margin: None,
+                stake_hint: Some(10.0),
+                start_time: String::from("2026-04-05T14:00:00Z"),
+                updated_at: String::from("2026-04-05T12:00:00Z"),
+                event_url: String::from("https://matchbook.example/event"),
+                deep_link_url: String::from("https://matchbook.example/market"),
+                is_live: false,
+                quotes: vec![sabisabi::MarketQuoteComparisonRow {
+                    source: sabisabi::DataSource::oddsentry(),
+                    event_id: String::from("event-1"),
+                    market_id: String::from("mkt-1"),
+                    selection_id: String::from("sel-1"),
+                    event_name: String::from("Arsenal vs Everton"),
+                    market_name: String::from("BTTS"),
+                    selection_name: String::from("Yes"),
+                    side: String::from("back"),
+                    venue: String::from("matchbook"),
+                    price: Some(1.91),
+                    fair_price: Some(1.78),
+                    liquidity: Some(200.0),
+                    event_url: String::from("https://matchbook.example/event"),
+                    deep_link_url: String::from("https://matchbook.example/market"),
+                    updated_at: String::from("2026-04-05T12:00:00Z"),
+                    is_live: false,
+                    is_sharp: true,
+                    notes: Vec::new(),
+                    raw_data: serde_json::Value::Null,
+                }],
+                notes: Vec::new(),
+                raw_data: serde_json::Value::Null,
+            }],
+            ..sabisabi::MarketIntelDashboard::default()
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/execution/submit")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"match_id": "ev-1", "stake": 12.5}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["gateway"]["mode"], "stub");
+    assert_eq!(json["result"]["accepted"], false);
+    assert_eq!(json["result"]["stake"], 12.5);
+}
+
+#[tokio::test]
 async fn control_start_endpoint_marks_worker_running() {
     let app = sabisabi::build_router_for_test();
 
