@@ -8,6 +8,50 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+#[derive(Debug)]
+pub enum MatchbookApiError {
+    HttpError { status: u16, body: String },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for MatchbookApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchbookApiError::HttpError { status, body } => {
+                write!(f, "HTTP {} error: {}", status, body)
+            }
+            MatchbookApiError::Other(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl std::error::Error for MatchbookApiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MatchbookApiError::Other(err) => Some(err.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for MatchbookApiError {
+    fn from(err: anyhow::Error) -> Self {
+        MatchbookApiError::Other(err)
+    }
+}
+
+impl From<reqwest::Error> for MatchbookApiError {
+    fn from(err: reqwest::Error) -> Self {
+        MatchbookApiError::Other(anyhow::Error::from(err))
+    }
+}
+
+impl From<serde_json::Error> for MatchbookApiError {
+    fn from(err: serde_json::Error) -> Self {
+        MatchbookApiError::Other(anyhow::Error::from(err))
+    }
+}
+
 #[derive(Clone)]
 pub struct MatchbookMonitorConfig {
     pub base_url: String,
@@ -174,7 +218,9 @@ impl MatchbookMonitorService {
 
         let client = match client {
             Some(client) => client,
-            None => AsyncMatchbookApiClient::new(config.as_ref()).await?,
+            None => AsyncMatchbookApiClient::new(config.as_ref())
+                .await
+                .map_err(|e| anyhow!("{}", e))?,
         };
 
         match load_matchbook_account_state_with_async_client(&client).await {
@@ -187,10 +233,13 @@ impl MatchbookMonitorService {
                 });
                 Ok(account_state)
             }
-            Err(error) if matchbook_error_has_status(&error, 401) => {
-                let refreshed_client = AsyncMatchbookApiClient::new(config.as_ref()).await?;
-                let account_state =
-                    load_matchbook_account_state_with_async_client(&refreshed_client).await?;
+            Err(MatchbookApiError::HttpError { status: 401, .. }) => {
+                let refreshed_client = AsyncMatchbookApiClient::new(config.as_ref())
+                    .await
+                    .map_err(|e| anyhow!("{}", e))?;
+                let account_state = load_matchbook_account_state_with_async_client(&refreshed_client)
+                    .await
+                    .map_err(|e| anyhow!("{}", e))?;
                 let mut state = self.state.lock().await;
                 state.client = Some(refreshed_client);
                 state.rate_limited_until = None;
@@ -200,27 +249,28 @@ impl MatchbookMonitorService {
                 });
                 Ok(account_state)
             }
-            Err(error) if matchbook_error_has_status(&error, 429) => {
+            Err(MatchbookApiError::HttpError { status: 429, body }) => {
                 let mut state = self.state.lock().await;
                 state.client = None;
                 state.rate_limited_until = Some(Instant::now() + Duration::from_secs(10 * 60));
-                Err(error)
+                Err(anyhow!("{}", body))
             }
             Err(error) => {
                 let mut state = self.state.lock().await;
                 state.client = Some(client);
-                Err(error)
+                Err(anyhow!("{}", error))
             }
         }
     }
 }
 
 impl AsyncMatchbookApiClient {
-    async fn new(config: &MatchbookMonitorConfig) -> Result<Self> {
+    async fn new(config: &MatchbookMonitorConfig) -> Result<Self, MatchbookApiError> {
         let client = AsyncClient::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(20))
-            .build()?;
+            .build()
+            .map_err(|e| MatchbookApiError::Other(anyhow::Error::from(e)))?;
         let token = match config
             .session_token
             .as_deref()
@@ -245,22 +295,22 @@ impl AsyncMatchbookApiClient {
         })
     }
 
-    async fn account(&self) -> Result<Value> {
+    async fn account(&self) -> Result<Value, MatchbookApiError> {
         self.get_json("/edge/rest/account", "Matchbook account")
             .await
     }
 
-    async fn balance(&self) -> Result<Value> {
+    async fn balance(&self) -> Result<Value, MatchbookApiError> {
         self.get_json("/edge/rest/account/balance", "Matchbook balance")
             .await
     }
 
-    async fn positions(&self) -> Result<Value> {
+    async fn positions(&self) -> Result<Value, MatchbookApiError> {
         self.get_json("/edge/rest/account/positions", "Matchbook positions")
             .await
     }
 
-    async fn current_offers(&self) -> Result<Value> {
+    async fn current_offers(&self) -> Result<Value, MatchbookApiError> {
         self.get_json(
             "/edge/rest/reports/v2/offers/current",
             "Matchbook current offers",
@@ -268,7 +318,7 @@ impl AsyncMatchbookApiClient {
         .await
     }
 
-    async fn current_bets(&self) -> Result<Value> {
+    async fn current_bets(&self) -> Result<Value, MatchbookApiError> {
         self.get_json(
             "/edge/rest/reports/v2/bets/current",
             "Matchbook current bets",
@@ -276,7 +326,7 @@ impl AsyncMatchbookApiClient {
         .await
     }
 
-    async fn get_json(&self, path: &str, label: &str) -> Result<Value> {
+    async fn get_json(&self, path: &str, label: &str) -> Result<Value, MatchbookApiError> {
         self.send_json(Method::GET, path, None, label).await
     }
 
@@ -286,7 +336,7 @@ impl AsyncMatchbookApiClient {
         path: &str,
         body: Option<&Value>,
         label: &str,
-    ) -> Result<Value> {
+    ) -> Result<Value, MatchbookApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self
             .client
@@ -302,11 +352,14 @@ impl AsyncMatchbookApiClient {
         let status = response.status();
         let response_body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "{label} failed with {}: {}",
-                status,
-                truncate(&response_body, 220)
-            ));
+            return Err(MatchbookApiError::HttpError {
+                status: status.as_u16(),
+                body: format!(
+                    "{label} failed with {}: {}",
+                    status,
+                    truncate(&response_body, 220)
+                ),
+            });
         }
         if response_body.trim().is_empty() {
             return Ok(Value::Null);
@@ -320,15 +373,15 @@ async fn matchbook_session_token_async(
     base_url: &str,
     username: Option<&str>,
     password: Option<&str>,
-) -> Result<String> {
+) -> Result<String, MatchbookApiError> {
     let username = username
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("missing Matchbook username"))?;
+        .ok_or_else(|| MatchbookApiError::Other(anyhow!("missing Matchbook username")))?;
     let password = password
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("missing Matchbook password"))?;
+        .ok_or_else(|| MatchbookApiError::Other(anyhow!("missing Matchbook password")))?;
     let response = client
         .post(format!("{base_url}/bpapi/rest/security/session"))
         .header("accept", "application/json")
@@ -342,11 +395,14 @@ async fn matchbook_session_token_async(
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        return Err(anyhow!(
-            "Matchbook session login failed with {}: {}",
-            status,
-            truncate(&body, 220)
-        ));
+        return Err(MatchbookApiError::HttpError {
+            status: status.as_u16(),
+            body: format!(
+                "Matchbook session login failed with {}: {}",
+                status,
+                truncate(&body, 220)
+            ),
+        });
     }
     let value: Value = serde_json::from_str(&body)?;
     first_non_empty_string(
@@ -359,12 +415,14 @@ async fn matchbook_session_token_async(
             "/data/session_token",
         ],
     )
-    .ok_or_else(|| anyhow!("Matchbook session response did not include a session token"))
+    .ok_or_else(|| {
+        MatchbookApiError::Other(anyhow!("Matchbook session response did not include a session token"))
+    })
 }
 
 async fn load_matchbook_account_state_with_async_client(
     client: &AsyncMatchbookApiClient,
-) -> Result<MatchbookAccountState> {
+) -> Result<MatchbookAccountState, MatchbookApiError> {
     let account = client.account().await?;
     let balance = client.balance().await?;
     let current_offers = client.current_offers().await?;
@@ -772,10 +830,6 @@ fn matchbook_account_label_from_value(value: &Value) -> Option<String> {
             "/account_name",
         ],
     )
-}
-
-fn matchbook_error_has_status(error: &anyhow::Error, status_code: u16) -> bool {
-    error.to_string().contains(&format!(" {status_code}:"))
 }
 
 fn runner_count_suffix(count: usize) -> String {
