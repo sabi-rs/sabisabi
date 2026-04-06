@@ -24,8 +24,9 @@ Within the Sabi workspace, this is the preferred backend/API layer for persisted
 - `GET /api/v1/query/state-change-audit` - query persisted audit trail rows
 - `GET /api/v1/query/market-intel/dashboard` - read persisted market-intel dashboard from Postgres
 - `GET /api/v1/query/operator/active` - return operator-focused ranked matches built from market-intel and live-event data
+- `GET /api/v1/query/operator/snapshot` - return the backend-owned composite operator snapshot used by the console
 - `GET /api/v1/query/operator/matchbook/account` - read backend-owned Matchbook account monitor state
-- `POST /api/v1/control/operator/snapshot` - drive the legacy snapshot boundary behind the backend and return the resulting operator snapshot
+- `POST /api/v1/control/operator/snapshot` - drive the legacy snapshot boundary behind the backend and return the resulting composite operator snapshot
 - `POST /api/v1/control/operator/matchbook/account/refresh` - force a backend Matchbook monitor refresh
 - `POST /api/v1/execution/review` - review an execution plan for a ranked opportunity
 - `POST /api/v1/execution/submit` - submit an execution plan for a ranked opportunity
@@ -104,6 +105,7 @@ Copy `.env.example` into your local env management flow before wiring a real Pos
 - `sabisabi` is the durable boundary for market-intel persistence and query APIs.
 - The console should consume this service over HTTP rather than embedding ingestion or venue-monitor logic.
 - Legacy recorder snapshots and Matchbook monitoring now sit behind `sabisabi` control/query surfaces rather than the TUI hot path.
+- The backend now owns the operator snapshot composition step that merges the legacy snapshot bridge, Matchbook account state, persisted market-intel quotes, and live-event context before the console renders it.
 - Presence in the endpoint catalog does not imply that every external endpoint is actively polled.
 - Redis caching is optional; Postgres remains the source of truth.
 

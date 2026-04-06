@@ -6,6 +6,7 @@ mod matchbook;
 mod model;
 mod operator;
 mod operator_snapshot;
+mod operator_snapshot_view;
 mod owls;
 mod repository;
 
@@ -34,7 +35,6 @@ use repository::audit::{AuditContext, AuditRepository};
 use repository::control::ControlRepository;
 use repository::live_events::LiveEventRepository;
 use repository::market_intel::MarketIntelRepository;
-use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -54,6 +54,7 @@ pub use operator::{
     StrategyRecommendation,
 };
 pub use operator_snapshot::{OperatorSnapshotAction, OperatorSnapshotControlRequest};
+pub use operator_snapshot_view::OperatorSnapshotEnvelope;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -341,7 +342,7 @@ impl AppState {
                 session_token: settings.matchbook_session_token.clone(),
                 username: settings.matchbook_username.clone(),
                 password: settings.matchbook_password.clone(),
-                cache_ttl: Duration::from_secs(settings.hot_cache_ttl_secs().clamp(5, 30)),
+                cache_ttl: Duration::from_secs(settings.hot_cache_ttl_secs().clamp(5, 300)),
             })
         } else {
             matchbook::MatchbookMonitorService::disabled()
@@ -477,6 +478,41 @@ impl AppState {
                 ))
             })
     }
+
+    async fn load_operator_snapshot_envelope(
+        &self,
+        request: &OperatorSnapshotControlRequest,
+    ) -> Result<OperatorSnapshotEnvelope, ApiError> {
+        let base_snapshot = tokio::task::spawn_blocking({
+            let service = self.operator_snapshot_service.clone();
+            let request = request.clone();
+            move || service.load_snapshot(&request)
+        })
+        .await
+        .context("failed to join operator snapshot task")??;
+
+        let market_intel_dashboard = self
+            .market_intel_repository
+            .read_dashboard(&MarketIntelFilter::default())
+            .await?;
+        let live_events = self
+            .live_event_repository
+            .read_live_events(&LiveEventsFilter::default())
+            .await?;
+        let matchbook_account_state = self
+            .matchbook_monitor_service
+            .load_account_state(false)
+            .await
+            .ok();
+
+        operator_snapshot_view::compose_operator_snapshot(
+            base_snapshot,
+            matchbook_account_state,
+            &market_intel_dashboard,
+            &live_events,
+        )
+        .map_err(ApiError::from)
+    }
 }
 
 impl Settings {
@@ -591,6 +627,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query_market_intel_dashboard),
         )
         .route("/api/v1/query/operator/active", get(query_operator_active))
+        .route(
+            "/api/v1/query/operator/snapshot",
+            get(query_operator_snapshot),
+        )
         .route(
             "/api/v1/query/operator/matchbook/account",
             get(query_matchbook_account_state),
@@ -804,19 +844,23 @@ async fn query_matchbook_account_state(
     Ok(Json(account_state))
 }
 
+async fn query_operator_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OperatorSnapshotEnvelope>, ApiError> {
+    let request = OperatorSnapshotControlRequest::default();
+    let envelope = state.load_operator_snapshot_envelope(&request).await?;
+    Ok(Json(envelope))
+}
+
 async fn control_operator_snapshot(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<OperatorSnapshotControlRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OperatorSnapshotEnvelope>, ApiError> {
     authorize_control_request(&state.settings, &headers)?;
-    let snapshot = tokio::task::spawn_blocking({
-        let service = state.operator_snapshot_service.clone();
-        move || service.load_snapshot(&request)
-    })
-    .await
-    .context("failed to join operator snapshot task")??;
-    Ok(Json(snapshot))
+    tracing::debug!(action = ?request.action, venue = ?request.venue, "control operator snapshot request");
+    let envelope = state.load_operator_snapshot_envelope(&request).await?;
+    Ok(Json(envelope))
 }
 
 async fn control_refresh_matchbook_account_state(

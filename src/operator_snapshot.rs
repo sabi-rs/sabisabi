@@ -3,10 +3,13 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
 pub struct OperatorSnapshotService {
@@ -155,12 +158,43 @@ impl OperatorSnapshotService {
         }
         drop(stdin);
 
-        let mut reader = BufReader::new(stdout);
         let mut responses = Vec::with_capacity(requests.len());
+        let reader = BufReader::new(stdout);
+        let (tx, rx) = mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let timeout = Duration::from_secs(60);
         for _ in 0..requests.len() {
-            let mut line = String::new();
-            let byte_count = reader.read_line(&mut line)?;
-            if byte_count == 0 {
+            let line = match rx.recv_timeout(timeout) {
+                Ok(Ok(line)) => line,
+                Ok(Err(e)) => {
+                    let _ = reader_thread.join();
+                    return Err(anyhow!("worker session read error: {}", e))
+                        .with_context(|| "failed to read worker session response");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.kill();
+                    let _ = reader_thread.join();
+                    return Err(anyhow!("worker session timed out after {:?}", timeout))
+                        .with_context(|| "failed to read worker session response");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            if line.is_empty() {
                 break;
             }
             responses.push(
@@ -169,6 +203,7 @@ impl OperatorSnapshotService {
             );
         }
 
+        let _ = reader_thread.join();
         let stderr_output = read_stream(stderr)?;
         let status = child.wait()?;
         if !status.success() && responses.is_empty() {
@@ -272,13 +307,34 @@ fn worker_command_path(configured: &Path) -> PathBuf {
 }
 
 fn discover_default_bet_recorder_command() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent()?;
-    let candidate = repo_root
-        .join("bet-recorder")
-        .join("bin")
-        .join("bet-recorder");
-    candidate.exists().then_some(candidate)
+    if let Ok(path) = env::var("BET_RECORDER_PATH") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidate = exe_dir.join("bet-recorder");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            let candidate = exe_dir.join("bin").join("bet-recorder");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        if let Some(repo_root) = exe_path.ancestors().nth(3) {
+            let candidate = repo_root
+                .join("bet-recorder")
+                .join("bin")
+                .join("bet-recorder");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn read_stream<R: std::io::Read>(mut reader: R) -> Result<String> {
@@ -290,7 +346,7 @@ fn read_stream<R: std::io::Read>(mut reader: R) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OperatorSnapshotAction, OperatorSnapshotControlRequest, parse_f64, worker_config_payload,
+        parse_f64, worker_config_payload, OperatorSnapshotAction, OperatorSnapshotControlRequest,
     };
     use std::path::PathBuf;
 
