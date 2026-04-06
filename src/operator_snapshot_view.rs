@@ -403,7 +403,7 @@ fn apply_external_live_context(snapshot: &mut SnapshotPayload) {
         open_position.current_score_home = live_event.home_score;
         open_position.current_score_away = live_event.away_score;
         if let (Some(away), Some(home)) = (live_event.away_score, live_event.home_score) {
-            open_position.current_score = format!("{away}-{home}");
+            open_position.current_score = format!("{home}-{away}");
         }
         if !live_event.display_clock.trim().is_empty() {
             open_position.live_clock = live_event.display_clock.clone();
@@ -668,7 +668,7 @@ fn market_matches(left: &str, right: &str) -> bool {
 
 fn event_matches(left: &str, right: &str) -> bool {
     if left.trim().is_empty() || right.trim().is_empty() {
-        return true;
+        return false;
     }
     if text_matches(left, right) {
         return true;
