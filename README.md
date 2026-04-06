@@ -24,6 +24,14 @@ Within the Sabi workspace, this is the preferred backend/API layer for persisted
 - `GET /api/v1/query/state-change-audit` - query persisted audit trail rows
 - `GET /api/v1/query/market-intel/dashboard` - read persisted market-intel dashboard from Postgres
 - `GET /api/v1/query/operator/active` - return operator-focused ranked matches built from market-intel and live-event data
+- `GET /api/v1/query/operator/snapshot` - return the backend-owned composite operator snapshot used by the console
+- `GET /api/v1/query/operator/matchbook/account` - read backend-owned Matchbook account monitor state
+- `POST /api/v1/control/operator/snapshot` - drive the legacy snapshot boundary behind the backend and return the resulting composite operator snapshot
+- `POST /api/v1/control/operator/matchbook/account/refresh` - force a backend Matchbook monitor refresh
+- `POST /api/v1/execution/review` - review an execution plan for a ranked opportunity
+- `POST /api/v1/execution/submit` - submit an execution plan for a ranked opportunity
+- `POST /api/v1/execution/ad-hoc/review` - review an ad hoc execution request
+- `POST /api/v1/execution/ad-hoc/submit` - submit an ad hoc execution request
 - `/api/v1/owls/*` - declared compatibility surface; currently scaffolded rather than implemented end-to-end
 
 ## Startup Sequence
@@ -75,12 +83,15 @@ The service reads these environment variables:
 - `SABISABI_BIND_ADDRESS`
 - `SABISABI_PORT`
 - `SABISABI_DATABASE_URL`
-- `SABISABI_CONTROL_TOKEN` for protecting `POST /api/v1/control/*` when the service is exposed beyond loopback
+- `SABISABI_CONTROL_TOKEN` for protecting `POST /api/v1/control/*` and execution submit/review routes when the service is exposed beyond loopback
 - `SABISABI_AUDIT_RETENTION_DAYS` for audit retention pruning
 - `SABISABI_OWLS_API_KEY` or `OWLS_INSIGHT_API_KEY` for Owls-backed refresh/realtime ingest
 - `SABISABI_OWLS_BASE_URL` to override the Owls base URL
 - `SABISABI_OWLS_REALTIME_SPORTS` as a comma-separated sport list
 - `SABISABI_OWLS_REALTIME_IDLE_RECONNECT_SECS` to tune realtime reconnect behavior
+- `SABISABI_MATCHBOOK_SESSION_TOKEN` or `MATCHBOOK_SESSION_TOKEN` for a pre-issued Matchbook session
+- `SABISABI_MATCHBOOK_USERNAME` / `SABISABI_MATCHBOOK_PASSWORD` or their `MATCHBOOK_*` equivalents for backend-owned Matchbook login
+- `SABI_RECORDER_CONFIG_PATH` to override the recorder config used by the backend snapshot bridge
 - `SABISABI_REDIS_URL` to enable Redis hot caching
 - `SABISABI_HOT_CACHE_TTL_SECS` to tune hot-cache TTL
 
@@ -92,7 +103,9 @@ Copy `.env.example` into your local env management flow before wiring a real Pos
 ## Data Boundaries
 
 - `sabisabi` is the durable boundary for market-intel persistence and query APIs.
-- The console should consume this service over HTTP rather than embedding ingestion logic.
+- The console should consume this service over HTTP rather than embedding ingestion or venue-monitor logic.
+- Legacy recorder snapshots and Matchbook monitoring now sit behind `sabisabi` control/query surfaces rather than the TUI hot path.
+- The backend now owns the operator snapshot composition step that merges the legacy snapshot bridge, Matchbook account state, persisted market-intel quotes, and live-event context before the console renders it.
 - Presence in the endpoint catalog does not imply that every external endpoint is actively polled.
 - Redis caching is optional; Postgres remains the source of truth.
 

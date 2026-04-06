@@ -2,8 +2,11 @@ mod cache;
 mod error;
 mod execution;
 mod market_intel;
+mod matchbook;
 mod model;
 mod operator;
+mod operator_snapshot;
+mod operator_snapshot_view;
 mod owls;
 mod repository;
 
@@ -12,6 +15,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
@@ -43,11 +47,14 @@ pub use market_intel::models::{
     DataSource, MarketIntelDashboard, MarketOpportunityRow, MarketQuoteComparisonRow,
     OpportunityKind,
 };
+pub use matchbook::MatchbookAccountState;
 pub use model::TestLiveEvent;
 pub use operator::{
     ExecutionPlan, MatchOpportunity, OperatorActiveFilter, OperatorActiveResponse,
     StrategyRecommendation,
 };
+pub use operator_snapshot::{OperatorSnapshotAction, OperatorSnapshotControlRequest};
+pub use operator_snapshot_view::OperatorSnapshotEnvelope;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +64,8 @@ pub struct AppState {
     execution_service: execution::ExecutionService,
     live_event_repository: LiveEventRepository,
     market_intel_repository: MarketIntelRepository,
+    matchbook_monitor_service: matchbook::MatchbookMonitorService,
+    operator_snapshot_service: operator_snapshot::OperatorSnapshotService,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +334,21 @@ impl AppState {
     /// Returns an error if the database connection fails or migrations cannot be applied.
     pub async fn from_settings(settings: Settings) -> Result<Self> {
         settings.validate()?;
+        let matchbook_monitor_service = if settings.matchbook_session_token.is_some()
+            || (settings.matchbook_username.is_some() && settings.matchbook_password.is_some())
+        {
+            matchbook::MatchbookMonitorService::from_config(matchbook::MatchbookMonitorConfig {
+                base_url: settings.matchbook_base_url.clone(),
+                session_token: settings.matchbook_session_token.clone(),
+                username: settings.matchbook_username.clone(),
+                password: settings.matchbook_password.clone(),
+                cache_ttl: Duration::from_secs(settings.hot_cache_ttl_secs().clamp(5, 300)),
+            })
+        } else {
+            matchbook::MatchbookMonitorService::disabled()
+        };
+        let operator_snapshot_service =
+            operator_snapshot::OperatorSnapshotService::from_settings(&settings);
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .connect(&settings.database_url)
@@ -360,6 +384,8 @@ impl AppState {
             execution_service,
             live_event_repository,
             market_intel_repository,
+            matchbook_monitor_service,
+            operator_snapshot_service,
         })
     }
 
@@ -399,6 +425,11 @@ impl AppState {
                 live_events.into_iter().map(Into::into).collect(),
             ),
             market_intel_repository: MarketIntelRepository::for_test(dashboard),
+            matchbook_monitor_service: matchbook::MatchbookMonitorService::disabled(),
+            operator_snapshot_service:
+                operator_snapshot::OperatorSnapshotService::for_test_with_config_path(
+                    PathBuf::from("/tmp/recorder.json"),
+                ),
         }
     }
 
@@ -447,6 +478,41 @@ impl AppState {
                 ))
             })
     }
+
+    async fn load_operator_snapshot_envelope(
+        &self,
+        request: &OperatorSnapshotControlRequest,
+    ) -> Result<OperatorSnapshotEnvelope, ApiError> {
+        let base_snapshot = tokio::task::spawn_blocking({
+            let service = self.operator_snapshot_service.clone();
+            let request = request.clone();
+            move || service.load_snapshot(&request)
+        })
+        .await
+        .context("failed to join operator snapshot task")??;
+
+        let market_intel_dashboard = self
+            .market_intel_repository
+            .read_dashboard(&MarketIntelFilter::default())
+            .await?;
+        let live_events = self
+            .live_event_repository
+            .read_live_events(&LiveEventsFilter::default())
+            .await?;
+        let matchbook_account_state = self
+            .matchbook_monitor_service
+            .load_account_state(false)
+            .await
+            .ok();
+
+        operator_snapshot_view::compose_operator_snapshot(
+            base_snapshot,
+            matchbook_account_state,
+            &market_intel_dashboard,
+            &live_events,
+        )
+        .map_err(ApiError::from)
+    }
 }
 
 impl Settings {
@@ -486,6 +552,18 @@ impl Settings {
             username: self.matchbook_username.clone()?,
             password: self.matchbook_password.clone()?,
         })
+    }
+
+    fn operator_snapshot_recorder_config_path(&self) -> PathBuf {
+        if let Some(path) = env::var_os("SABI_RECORDER_CONFIG_PATH") {
+            return PathBuf::from(path);
+        }
+
+        let base = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("sabi").join("recorder.json")
     }
 }
 
@@ -549,6 +627,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query_market_intel_dashboard),
         )
         .route("/api/v1/query/operator/active", get(query_operator_active))
+        .route(
+            "/api/v1/query/operator/snapshot",
+            get(query_operator_snapshot),
+        )
+        .route(
+            "/api/v1/query/operator/matchbook/account",
+            get(query_matchbook_account_state),
+        )
+        .route(
+            "/api/v1/control/operator/snapshot",
+            post(control_operator_snapshot),
+        )
+        .route(
+            "/api/v1/control/operator/matchbook/account/refresh",
+            post(control_refresh_matchbook_account_state),
+        )
         .route(
             "/api/v1/query/execution/plan/{match_id}",
             get(query_execution_plan),
@@ -740,6 +834,47 @@ async fn query_operator_active(
     )))
 }
 
+async fn query_matchbook_account_state(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<MatchbookAccountState>, ApiError> {
+    let account_state = state
+        .matchbook_monitor_service
+        .load_account_state(false)
+        .await?;
+    Ok(Json(account_state))
+}
+
+async fn query_operator_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OperatorSnapshotEnvelope>, ApiError> {
+    let request = OperatorSnapshotControlRequest::default();
+    let envelope = state.load_operator_snapshot_envelope(&request).await?;
+    Ok(Json(envelope))
+}
+
+async fn control_operator_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<OperatorSnapshotControlRequest>,
+) -> Result<Json<OperatorSnapshotEnvelope>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
+    tracing::debug!(action = ?request.action, venue = ?request.venue, "control operator snapshot request");
+    let envelope = state.load_operator_snapshot_envelope(&request).await?;
+    Ok(Json(envelope))
+}
+
+async fn control_refresh_matchbook_account_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<MatchbookAccountState>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
+    let account_state = state
+        .matchbook_monitor_service
+        .load_account_state(true)
+        .await?;
+    Ok(Json(account_state))
+}
+
 async fn query_execution_plan(
     State(state): State<Arc<AppState>>,
     Path(match_id): Path<String>,
@@ -755,8 +890,10 @@ async fn query_execution_plan(
 
 async fn review_execution_plan(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ExecutionReviewRequest>,
 ) -> Result<Json<ExecutionReviewResponse>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
     let opportunity = state.find_operator_match(&request.match_id).await?;
     let response = state
         .execution_service
@@ -768,8 +905,10 @@ async fn review_execution_plan(
 
 async fn submit_execution_plan(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ExecutionSubmitRequest>,
 ) -> Result<Json<ExecutionSubmitResponse>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
     let opportunity = state.find_operator_match(&request.match_id).await?;
     let response = state
         .execution_service
@@ -781,8 +920,10 @@ async fn submit_execution_plan(
 
 async fn review_execution_adhoc(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<AdhocExecutionRequest>,
 ) -> Result<Json<ExecutionReviewResponse>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
     let response = state
         .execution_service
         .review_adhoc(request)
@@ -793,8 +934,10 @@ async fn review_execution_adhoc(
 
 async fn submit_execution_adhoc(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<AdhocExecutionRequest>,
 ) -> Result<Json<ExecutionSubmitResponse>, ApiError> {
+    authorize_control_request(&state.settings, &headers)?;
     let response = state
         .execution_service
         .submit_adhoc(request)

@@ -711,8 +711,8 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_operator_active_response, dashboard_sport_key_for_filter, OperatorActiveFilter,
-        StrategyAction,
+        OperatorActiveFilter, StrategyAction, build_operator_active_response,
+        dashboard_sport_key_for_filter,
     };
     use crate::market_intel::models::{
         DataSource, MarketIntelDashboard, MarketOpportunityRow, MarketQuoteComparisonRow,
