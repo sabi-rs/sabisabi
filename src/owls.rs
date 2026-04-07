@@ -416,6 +416,29 @@ fn schedule_dashboard_refresh(
             return;
         }
 
+        struct RefreshGuard {
+            state: Arc<crate::AppState>,
+            sport: String,
+            section: DashboardSection,
+        }
+
+        impl Drop for RefreshGuard {
+            fn drop(&mut self) {
+                let state = self.state.clone();
+                let sport = self.sport.clone();
+                let section = self.section;
+                tokio::spawn(async move {
+                    state.owls_dashboard_store.finish_refresh(&sport, section).await;
+                });
+            }
+        }
+
+        let _guard = RefreshGuard {
+            state: state.clone(),
+            sport: sport.clone(),
+            section,
+        };
+
         let dashboard = match build_dashboard_response(&state, &sport, section).await {
             Ok(dashboard) => dashboard,
             Err(error) => degraded_dashboard_response(
@@ -429,7 +452,6 @@ fn schedule_dashboard_refresh(
             .owls_dashboard_store
             .insert(&sport, section, dashboard)
             .await;
-        state.owls_dashboard_store.finish_refresh(&sport, section).await;
     });
 }
 
@@ -1198,10 +1220,13 @@ fn stringify(value: Option<&serde_json::Value>) -> String {
 }
 
 fn truncate(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
+    let char_count = value.chars().count();
+    if char_count <= limit {
         value.to_string()
     } else {
-        format!("{}...", &value[..limit.saturating_sub(3)])
+        let take_count = limit.saturating_sub(3);
+        let truncated: String = value.chars().take(take_count).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -1358,46 +1383,6 @@ fn extract_market_quotes(
         }
     }
     quotes
-}
-
-fn build_market_selections(quotes: &[MarketQuoteResponse]) -> Vec<MarketSelectionResponse> {
-    let mut grouped = BTreeMap::<(String, String, String, String), MarketSelectionResponse>::new();
-    for quote in quotes.iter().filter(|quote| quote.decimal_price.is_some()) {
-        let key = (
-            normalize_key(&quote.event),
-            normalize_key(&quote.market_key),
-            normalize_key(&quote.selection),
-            quote.point.map(|value| format!("{value:.3}")).unwrap_or_default(),
-        );
-        let entry = grouped.entry(key).or_insert_with(|| MarketSelectionResponse {
-            event: quote.event.clone(),
-            market_key: quote.market_key.clone(),
-            selection: quote.selection.clone(),
-            point: quote.point,
-            league: quote.league.clone(),
-            country_code: quote.country_code.clone(),
-            quotes: Vec::new(),
-        });
-        entry.quotes.push(quote.clone());
-    }
-    let mut rows = grouped.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        quote_books(&right.quotes)
-            .cmp(&quote_books(&left.quotes))
-            .then_with(|| best_quote_price(&right.quotes).partial_cmp(&best_quote_price(&left.quotes)).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| left.event.cmp(&right.event))
-    });
-    for row in &mut rows {
-        row.quotes.sort_by(|left, right| {
-            right.decimal_price.unwrap_or_default()
-                .partial_cmp(&left.decimal_price.unwrap_or_default())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.book.cmp(&right.book))
-        });
-        row.quotes.truncate(MAX_QUOTES_PER_SELECTION);
-    }
-    rows.truncate(MAX_MARKET_SELECTIONS);
-    rows
 }
 
 #[derive(Default)]

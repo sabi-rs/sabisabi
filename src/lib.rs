@@ -126,6 +126,18 @@ impl Settings {
     pub fn from_env() -> Self {
         let defaults = Self::default();
 
+        let owls_api_key = env::var("SABISABI_OWLS_API_KEY")
+            .ok()
+            .or_else(|| env::var("OWLS_INSIGHT_API_KEY").ok())
+            .or_else(|| {
+                load_env_value_from_dotenv_candidates(&[
+                    "OWLS_INSIGHT_API_KEY",
+                    "OWLSINSIGHT_API_KEY",
+                ])
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
         Self {
             bind_address: env::var("SABISABI_BIND_ADDRESS").unwrap_or(defaults.bind_address),
             control_token: env::var("SABISABI_CONTROL_TOKEN")
@@ -137,17 +149,7 @@ impl Settings {
                 .ok()
                 .and_then(|value| value.parse::<i64>().ok())
                 .or(defaults.audit_retention_days),
-            owls_api_key: env::var("SABISABI_OWLS_API_KEY")
-                .ok()
-                .or_else(|| env::var("OWLS_INSIGHT_API_KEY").ok())
-                .or_else(|| {
-                    load_env_value_from_dotenv_candidates(&[
-                        "OWLS_INSIGHT_API_KEY",
-                        "OWLSINSIGHT_API_KEY",
-                    ])
-                })
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            owls_api_key: owls_api_key.clone(),
             owls_base_url: env::var("SABISABI_OWLS_BASE_URL").unwrap_or(defaults.owls_base_url),
             owls_dashboard_refresh_secs: env::var("SABISABI_OWLS_DASHBOARD_REFRESH_SECS")
                 .ok()
@@ -156,7 +158,7 @@ impl Settings {
             owls_realtime_stream_enabled: env::var("SABISABI_OWLS_REALTIME_STREAM_ENABLED")
                 .ok()
                 .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(defaults.owls_realtime_stream_enabled),
+                .unwrap_or_else(|| owls_api_key.is_some()),
             owls_realtime_sports: env::var("SABISABI_OWLS_REALTIME_SPORTS")
                 .ok()
                 .map(|value| {
