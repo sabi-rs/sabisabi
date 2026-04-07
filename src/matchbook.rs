@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::Client as AsyncClient;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -10,15 +10,29 @@ use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub enum MatchbookApiError {
-    HttpError { status: u16, body: String, label: String },
+    HttpError {
+        status: u16,
+        body: String,
+        label: String,
+    },
     Other(anyhow::Error),
 }
 
 impl std::fmt::Display for MatchbookApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MatchbookApiError::HttpError { status, body, label } => {
-                write!(f, "{} failed with {}: {}", label, status, truncate(body, 220))
+            MatchbookApiError::HttpError {
+                status,
+                body,
+                label,
+            } => {
+                write!(
+                    f,
+                    "{} failed with {}: {}",
+                    label,
+                    status,
+                    truncate(body, 220)
+                )
             }
             MatchbookApiError::Other(e) => write!(f, "{}", e),
         }
@@ -194,8 +208,7 @@ impl MatchbookMonitorService {
                 if Instant::now() < until {
                     let remaining_secs = until.saturating_duration_since(Instant::now()).as_secs();
                     return Err(anyhow!(
-                        "Matchbook API remains rate limited; retry after {}s",
-                        remaining_secs
+                        "Matchbook API remains rate limited; retry after {remaining_secs}",
                     ));
                 }
                 state.rate_limited_until = None;
@@ -332,9 +345,15 @@ impl AsyncMatchbookApiClient {
                 .header("content-type", "application/json")
                 .json(body);
         }
-        let response = request.send().await.map_err(|e| MatchbookApiError::Other(e.into()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| MatchbookApiError::Other(e.into()))?;
         let status = response.status().as_u16();
-        let response_body = response.text().await.map_err(|e| MatchbookApiError::Other(e.into()))?;
+        let response_body = response
+            .text()
+            .await
+            .map_err(|e| MatchbookApiError::Other(e.into()))?;
         if !(200..300).contains(&status) {
             return Err(MatchbookApiError::HttpError {
                 status,
@@ -375,7 +394,10 @@ async fn matchbook_session_token_async(
         .await
         .map_err(|e| MatchbookApiError::Other(e.into()))?;
     let status = response.status().as_u16();
-    let body = response.text().await.map_err(|e| MatchbookApiError::Other(e.into()))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| MatchbookApiError::Other(e.into()))?;
     if !(200..300).contains(&status) {
         return Err(MatchbookApiError::HttpError {
             status,
@@ -383,7 +405,8 @@ async fn matchbook_session_token_async(
             label: "Matchbook session login".to_string(),
         });
     }
-    let value: Value = serde_json::from_str(&body).map_err(|e| MatchbookApiError::Other(e.into()))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| MatchbookApiError::Other(e.into()))?;
     first_non_empty_string(
         &value,
         &[

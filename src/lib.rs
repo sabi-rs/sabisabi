@@ -65,6 +65,7 @@ pub struct AppState {
     live_event_repository: LiveEventRepository,
     market_intel_repository: MarketIntelRepository,
     matchbook_monitor_service: matchbook::MatchbookMonitorService,
+    owls_dashboard_store: owls::DashboardStore,
     operator_snapshot_service: operator_snapshot::OperatorSnapshotService,
 }
 
@@ -76,6 +77,8 @@ pub struct Settings {
     audit_retention_days: Option<i64>,
     owls_api_key: Option<String>,
     owls_base_url: String,
+    owls_dashboard_refresh_secs: u64,
+    owls_realtime_stream_enabled: bool,
     owls_realtime_sports: Vec<String>,
     owls_realtime_idle_reconnect_secs: u64,
     matchbook_session_token: Option<String>,
@@ -96,6 +99,8 @@ impl Default for Settings {
             audit_retention_days: Some(90),
             owls_api_key: None,
             owls_base_url: String::from("https://api.owlsinsight.com"),
+            owls_dashboard_refresh_secs: 15,
+            owls_realtime_stream_enabled: false,
             owls_realtime_sports: vec![
                 String::from("soccer"),
                 String::from("nba"),
@@ -144,6 +149,14 @@ impl Settings {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             owls_base_url: env::var("SABISABI_OWLS_BASE_URL").unwrap_or(defaults.owls_base_url),
+            owls_dashboard_refresh_secs: env::var("SABISABI_OWLS_DASHBOARD_REFRESH_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(defaults.owls_dashboard_refresh_secs),
+            owls_realtime_stream_enabled: env::var("SABISABI_OWLS_REALTIME_STREAM_ENABLED")
+                .ok()
+                .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(defaults.owls_realtime_stream_enabled),
             owls_realtime_sports: env::var("SABISABI_OWLS_REALTIME_SPORTS")
                 .ok()
                 .map(|value| {
@@ -235,6 +248,24 @@ impl Settings {
     #[must_use]
     pub fn audit_retention_days(&self) -> Option<i64> {
         self.audit_retention_days
+    }
+
+    #[must_use]
+    pub(crate) fn owls_api_key(&self) -> Option<&str> {
+        self.owls_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    #[must_use]
+    pub(crate) fn owls_base_url(&self) -> &str {
+        &self.owls_base_url
+    }
+
+    #[must_use]
+    pub(crate) fn owls_dashboard_refresh_secs(&self) -> u64 {
+        self.owls_dashboard_refresh_secs
     }
 
     fn validate(&self) -> Result<()> {
@@ -385,6 +416,7 @@ impl AppState {
             live_event_repository,
             market_intel_repository,
             matchbook_monitor_service,
+            owls_dashboard_store: owls::DashboardStore::default(),
             operator_snapshot_service,
         })
     }
@@ -426,6 +458,7 @@ impl AppState {
             ),
             market_intel_repository: MarketIntelRepository::for_test(dashboard),
             matchbook_monitor_service: matchbook::MatchbookMonitorService::disabled(),
+            owls_dashboard_store: owls::DashboardStore::default(),
             operator_snapshot_service:
                 operator_snapshot::OperatorSnapshotService::for_test_with_config_path(
                     PathBuf::from("/tmp/recorder.json"),
@@ -517,6 +550,9 @@ impl AppState {
 
 impl Settings {
     pub(crate) fn owls_realtime_config(&self) -> Option<owls::RealtimeIngestConfig> {
+        if !self.owls_realtime_stream_enabled {
+            return None;
+        }
         let api_key = self.owls_api_key.clone()?;
         if self.owls_realtime_sports.is_empty() {
             return None;

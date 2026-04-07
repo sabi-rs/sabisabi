@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn owls_namespace_scaffolds_documented_rest_surface() {
+async fn owls_namespace_is_reserved_by_backend_even_without_upstream_credentials() {
     let app = sabisabi::build_router_for_test();
 
     let endpoints = [
@@ -61,8 +61,25 @@ async fn owls_namespace_scaffolds_documented_rest_surface() {
 
         assert_eq!(
             response.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "expected scaffolded route for {endpoint}",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expected backend-owned owls route for {endpoint}",
         );
     }
+}
+
+#[tokio::test]
+async fn owls_dashboard_namespace_is_reserved_by_backend() {
+    let app = sabisabi::build_router_for_test();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/owls/dashboard/soccer?section=markets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
