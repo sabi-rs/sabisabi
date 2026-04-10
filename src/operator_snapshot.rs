@@ -7,9 +7,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
 pub struct OperatorSnapshotService {
@@ -346,7 +346,7 @@ fn read_stream<R: std::io::Read>(mut reader: R) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_f64, worker_config_payload, OperatorSnapshotAction, OperatorSnapshotControlRequest,
+        OperatorSnapshotAction, OperatorSnapshotControlRequest, parse_f64, worker_config_payload,
     };
     use std::path::PathBuf;
 

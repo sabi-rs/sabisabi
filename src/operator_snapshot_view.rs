@@ -20,6 +20,7 @@ pub struct OperatorSnapshotEnvelope {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct SnapshotPayload {
+    worker: WorkerSummary,
     runtime: Option<RuntimeSummary>,
     open_positions: Vec<OpenPositionRow>,
     tracked_bets: Vec<TrackedBetRow>,
@@ -34,6 +35,20 @@ struct SnapshotPayload {
 #[serde(default)]
 struct RuntimeSummary {
     updated_at: String,
+    source: String,
+    refresh_kind: String,
+    worker_reconnect_count: usize,
+    decision_count: usize,
+    watcher_iteration: Option<usize>,
+    stale: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct WorkerSummary {
+    name: String,
+    status: String,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -164,8 +179,12 @@ pub fn compose_operator_snapshot(
 ) -> Result<OperatorSnapshotEnvelope> {
     let mut snapshot: SnapshotPayload = serde_json::from_value(base_snapshot)
         .context("failed to decode operator snapshot payload")?;
-    snapshot.external_quotes =
-        build_external_quote_rows(&snapshot, matchbook_account_state.as_ref(), market_intel_dashboard);
+    annotate_backend_provenance(&mut snapshot);
+    snapshot.external_quotes = build_external_quote_rows(
+        &snapshot,
+        matchbook_account_state.as_ref(),
+        market_intel_dashboard,
+    );
     snapshot.external_live_events = build_external_live_event_rows(&snapshot, live_events);
     apply_external_live_context(&mut snapshot);
 
@@ -174,6 +193,36 @@ pub fn compose_operator_snapshot(
             .context("failed to encode operator snapshot payload")?,
         matchbook_account_state,
     })
+}
+
+fn annotate_backend_provenance(snapshot: &mut SnapshotPayload) {
+    let upstream_worker = if snapshot.worker.name.trim().is_empty() {
+        String::from("legacy-base")
+    } else {
+        snapshot.worker.name.trim().to_string()
+    };
+    let upstream_worker_label = if upstream_worker == "bet-recorder" {
+        String::from("python-legacy bet-recorder")
+    } else {
+        upstream_worker.clone()
+    };
+
+    let upstream_detail = snapshot.worker.detail.trim();
+    snapshot.worker.name = String::from("sabisabi");
+    snapshot.worker.detail = if upstream_detail.is_empty() {
+        format!("backend-composite snapshot via {upstream_worker_label}")
+    } else {
+        format!("backend-composite snapshot via {upstream_worker_label}: {upstream_detail}")
+    };
+
+    if let Some(runtime) = snapshot.runtime.as_mut() {
+        let upstream_source = if runtime.source.trim().is_empty() {
+            upstream_worker
+        } else {
+            runtime.source.trim().to_string()
+        };
+        runtime.source = format!("backend-composite:{upstream_source}");
+    }
 }
 
 fn build_external_quote_rows(
@@ -576,10 +625,7 @@ fn matchbook_offer_matches_target(
         )
 }
 
-fn matchbook_bet_matches_target(
-    bet: &MatchbookBetRow,
-    target: &SnapshotMarketTarget,
-) -> bool {
+fn matchbook_bet_matches_target(bet: &MatchbookBetRow, target: &SnapshotMarketTarget) -> bool {
     event_matches(&bet.event_name, &target.event)
         && market_matches(&bet.market_name, &target.market)
         && selection_matches_with_context(
@@ -724,10 +770,14 @@ fn canonical_selection(selection: &str, event: &str, market: &str) -> Option<Str
     let participants = event_participants(event);
     if market_matches(market, "match odds") {
         if is_home_alias(&normalized) {
-            return participants.as_ref().map(|participants| participants.home.clone());
+            return participants
+                .as_ref()
+                .map(|participants| participants.home.clone());
         }
         if is_away_alias(&normalized) {
-            return participants.as_ref().map(|participants| participants.away.clone());
+            return participants
+                .as_ref()
+                .map(|participants| participants.away.clone());
         }
     }
     if let Some(participants) = participants {
@@ -809,7 +859,20 @@ mod tests {
     #[test]
     fn compose_operator_snapshot_projects_matchbook_and_market_intel_rows() {
         let base = json!({
-            "runtime": { "updated_at": "2026-04-06T12:00:00Z" },
+            "worker": {
+                "name": "bet-recorder",
+                "status": "ready",
+                "detail": "legacy capture healthy"
+            },
+            "runtime": {
+                "updated_at": "2026-04-06T12:00:00Z",
+                "source": "watcher-state",
+                "refresh_kind": "cached",
+                "worker_reconnect_count": 0,
+                "decision_count": 0,
+                "watcher_iteration": 12,
+                "stale": false
+            },
             "open_positions": [{
                 "event": "Malta vs Luxembourg",
                 "market": "Full-time result",
@@ -925,6 +988,11 @@ mod tests {
         assert_eq!(
             snapshot["open_positions"][0]["event_status"].as_str(),
             Some("live")
+        );
+        assert_eq!(snapshot["worker"]["name"].as_str(), Some("sabisabi"));
+        assert_eq!(
+            snapshot["runtime"]["source"].as_str(),
+            Some("backend-composite:watcher-state")
         );
         assert!(envelope.matchbook_account_state.is_some());
     }
